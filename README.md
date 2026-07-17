@@ -1,6 +1,6 @@
-# Motion Rush V5
+# Motion Rush V6
 
-A mobile-first endless runner controlled by body movement through the phone's front camera. V5 adds a reliable held-crouch-to-jump transition for rapid obstacle combinations while preserving V4's approved weighted jump physics, torso-normalized intent recognition, persisted Horizontal Sensitivity slider, absolute lane mapping, PWA support, and non-camera controls.
+A mobile-first endless runner controlled by body movement through the phone's front camera. V6 adds reliable jump-to-crouch chaining while preserving V5's crouch-to-jump transition, approved weighted jump physics, torso-normalized intent recognition, persisted Horizontal Sensitivity slider, absolute lane mapping, PWA support, and non-camera controls.
 
 ## Run it on Replit
 

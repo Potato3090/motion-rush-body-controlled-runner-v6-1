@@ -282,6 +282,149 @@ atomicCrouchJump.feed(Array(12).fill(0))
 atomicCrouchJump.feed([-0.05, -0.16, -0.24])
 assert.equal(atomicCrouchJump.events.jumps, 2)
 
+const directJumpIntoCrouch = [
+  0, -0.06, -0.16, -0.24, -0.3, -0.27, -0.18, -0.08,
+  0.03, 0.36, 0.39, 0.4, 0.4,
+]
+const postJumpDescentIntoCrouch = [
+  -0.18, -0.26, -0.2, -0.1, 0.03, 0.36, 0.39, 0.4, 0.4,
+]
+
+// V6 regression 1: a real jump may descend directly into a deliberate held
+// crouch. The single near-neutral crossing is far shorter than the normal
+// neutral confirmation, so this specifically exercises the new transition.
+const jumpToCrouch = createVerticalDriver()
+jumpToCrouch.feed(directJumpIntoCrouch)
+const jumpToCrouchStart = jumpToCrouch.events.samples.find((sample) => sample.crouchStarted)
+const firstJumpIndex = jumpToCrouch.events.samples.findIndex((sample) => sample.jumpTriggered)
+const crouchIndex = jumpToCrouch.events.samples.findIndex((sample) => sample.crouchStarted)
+const deliberateDepthIndex = jumpToCrouch.events.samples.findIndex(
+  (sample, index) => index > firstJumpIndex &&
+    sample.value >= VERTICAL_INTENT_TUNING.deliberateCrouchDepth,
+)
+const neutralFramesBeforeCrouch = jumpToCrouch.events.samples
+  .slice(firstJumpIndex + 1, crouchIndex)
+  .filter((sample) => Math.abs(sample.value) <= VERTICAL_INTENT_TUNING.neutralRearmThreshold)
+assert.equal(jumpToCrouch.events.jumps, 1)
+assert.equal(jumpToCrouch.events.crouchStarts, 1)
+assert.equal(jumpToCrouch.events.crouchEnds, 0)
+assert.ok(jumpToCrouch.events.phases.includes('postJumpCrouchPreparation'))
+assert.ok(
+  neutralFramesBeforeCrouch.length * (1000 / 30) < VERTICAL_INTENT_TUNING.neutralConfirmationMs,
+  'post-jump crouch must not require a neutral hold',
+)
+assert.ok(deliberateDepthIndex >= 0)
+assert.ok(
+  jumpToCrouchStart.now - jumpToCrouch.events.samples[deliberateDepthIndex].now <= 3 * (1000 / 30),
+  'post-jump crouch must confirm within three reliable 30 FPS frames',
+)
+assert.equal(jumpToCrouch.state.phase, 'crouched')
+assert.equal(jumpToCrouchStart?.crouching, true)
+assert.equal(jumpToCrouch.events.crouching.at(-1), true)
+
+// V6 regression 2: a normal landing stabilizes at neutral, fully rearms, and
+// never becomes a post-jump crouch candidate.
+const normalJumpLanding = createVerticalDriver()
+normalJumpLanding.feed([
+  0, -0.06, -0.16, -0.24, -0.3, -0.25, -0.16, -0.08,
+  0.02, 0.05, 0.03, 0, ...Array(10).fill(0),
+])
+assert.equal(normalJumpLanding.events.jumps, 1)
+assert.equal(normalJumpLanding.events.crouchStarts, 0)
+assert.equal(normalJumpLanding.state.phase, 'neutral')
+assert.equal(normalJumpLanding.events.phases.includes('postJumpCrouchPreparation'), false)
+
+// V6 regression 3: a shallow landing overshoot may briefly enter preparation,
+// but it cancels on the rebound without producing a slide.
+const shallowLandingDip = createVerticalDriver()
+shallowLandingDip.feed([
+  0, -0.06, -0.16, -0.24, -0.3, -0.22, -0.1, 0.04,
+  0.17, 0.12, 0.07, 0.03, 0, ...Array(10).fill(0),
+])
+assert.equal(shallowLandingDip.events.jumps, 1)
+assert.equal(shallowLandingDip.events.crouchStarts, 0)
+assert.ok(shallowLandingDip.events.phases.includes('postJumpCrouchPreparation'))
+assert.equal(shallowLandingDip.state.phase, 'neutral')
+
+// V6 regression 4: high downward velocity alone is not crouch intent when the
+// landing stops near neutral and never reaches the entry/depth thresholds.
+const fastNeutralLanding = createVerticalDriver()
+fastNeutralLanding.feed([
+  0, -0.06, -0.16, -0.26, -0.3, -0.2, 0.07,
+  ...Array(12).fill(0.05), ...Array(6).fill(0),
+])
+assert.equal(fastNeutralLanding.events.jumps, 1)
+assert.equal(fastNeutralLanding.events.crouchStarts, 0)
+assert.equal(fastNeutralLanding.events.phases.includes('postJumpCrouchPreparation'), false)
+assert.equal(fastNeutralLanding.state.phase, 'neutral')
+
+// V6 regression 5: the same physical jump-to-crouch motion classifies at each
+// realistic callback rate with exact single-action counts.
+for (const fps of [24, 30, 60]) {
+  const jumpCrouchAtRate = createVerticalDriver(1000 / fps)
+  jumpCrouchAtRate.feed(sampleKeyframes([
+    [0, 0], [90, -0.2], [170, -0.3], [260, -0.25],
+    [360, -0.08], [420, 0.12], [490, 0.39], [650, 0.4],
+  ], fps))
+  assert.equal(jumpCrouchAtRate.events.jumps, 1, `post-jump jump count at ${fps} FPS`)
+  assert.equal(jumpCrouchAtRate.events.crouchStarts, 1, `post-jump crouch at ${fps} FPS`)
+  assert.equal(jumpCrouchAtRate.events.crouchEnds, 0, `held post-jump crouch at ${fps} FPS`)
+  assert.equal(jumpCrouchAtRate.state.phase, 'crouched')
+}
+
+// V6 regression 6: jump -> crouch -> explosive jump keeps the V5 transition,
+// needs no neutral pause, and emits each edge exactly once.
+const jumpCrouchJump = createVerticalDriver()
+jumpCrouchJump.feed(directJumpIntoCrouch)
+jumpCrouchJump.feed([0.4, 0.4, 0.12, -0.08, -0.18])
+assert.equal(jumpCrouchJump.events.jumps, 2)
+assert.equal(jumpCrouchJump.events.crouchStarts, 1)
+assert.equal(jumpCrouchJump.events.crouchEnds, 1)
+assert.equal(jumpCrouchJump.state.phase, 'jumpCooldown')
+
+// V6 regression 7: the reverse alternating order also preserves every action:
+// grounded crouch -> V5 jump -> direct post-jump crouch.
+const crouchJumpCrouch = createVerticalDriver()
+crouchJumpCrouch.feed([...deepHold, ...Array(8).fill(0.4), -0.08])
+crouchJumpCrouch.feed(postJumpDescentIntoCrouch)
+assert.equal(crouchJumpCrouch.events.jumps, 1)
+assert.equal(crouchJumpCrouch.events.crouchStarts, 2)
+assert.equal(crouchJumpCrouch.events.crouchEnds, 1)
+assert.equal(crouchJumpCrouch.state.phase, 'crouched')
+assert.equal(crouchJumpCrouch.events.crouching.at(-1), true)
+
+// V6 regression 8: repeated jump -> crouch -> jump -> crouch chaining has no
+// lost or phantom action edges.
+const alternatingChain = createVerticalDriver()
+alternatingChain.feed(directJumpIntoCrouch)
+alternatingChain.feed([0.4, 0.12, -0.08])
+alternatingChain.feed(postJumpDescentIntoCrouch)
+assert.equal(alternatingChain.events.jumps, 2)
+assert.equal(alternatingChain.events.crouchStarts, 2)
+assert.equal(alternatingChain.events.crouchEnds, 1)
+assert.equal(alternatingChain.state.phase, 'crouched')
+
+// V6 regression 9: holding the post-jump crouch remains a continuous state;
+// it cannot spam crouch starts or synthesize another jump.
+const heldPostJumpCrouch = createVerticalDriver()
+heldPostJumpCrouch.feed(directJumpIntoCrouch)
+heldPostJumpCrouch.feed(Array(40).fill(0.4))
+assert.equal(heldPostJumpCrouch.events.jumps, 1)
+assert.equal(heldPostJumpCrouch.events.crouchStarts, 1)
+assert.equal(heldPostJumpCrouch.events.crouchEnds, 0)
+assert.equal(heldPostJumpCrouch.state.phase, 'crouched')
+
+// V6 regression 10: takeoff/descent noise remains inside jump lockout and
+// cannot create a duplicate jump or a false crouch.
+const noisyJumpCooldown = createVerticalDriver()
+noisyJumpCooldown.feed([
+  0, -0.06, -0.16, -0.24, -0.2, -0.28, -0.14, -0.23,
+  -0.08, 0.04, -0.03, 0.07, -0.02, ...Array(12).fill(0),
+])
+assert.equal(noisyJumpCooldown.events.jumps, 1)
+assert.equal(noisyJumpCooldown.events.crouchStarts, 0)
+assert.equal(noisyJumpCooldown.state.phase, 'neutral')
+
 // Millisecond timing and velocity normalization make intent classification
 // consistent across realistic camera callback rates.
 for (const fps of [24, 30, 60]) {

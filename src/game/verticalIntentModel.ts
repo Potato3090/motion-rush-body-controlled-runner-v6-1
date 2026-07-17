@@ -4,6 +4,7 @@ export type VerticalIntentPhase =
   | 'jumpPreparation'
   | 'crouched'
   | 'crouchJumpPreparation'
+  | 'postJumpCrouchPreparation'
   | 'rearming'
   | 'jumpCooldown'
 
@@ -27,6 +28,11 @@ export const VERTICAL_INTENT_TUNING = {
   directionReversalRise: 0.09,
   reversalJumpDisplacement: -0.04,
   jumpActionLockoutMs: 260,
+  postJumpCrouchEntryThreshold: 0.14,
+  postJumpCrouchMinimumDownwardVelocity: 0.45,
+  postJumpCrouchConfirmationMs: 65,
+  postJumpCrouchMaximumPreparationMs: 320,
+  postJumpCrouchCancelThreshold: 0.1,
   crouchRearmConfirmationMs: 80,
   crouchToJumpMinimumRise: 0.22,
   crouchToJumpUpwardVelocity: -1.05,
@@ -188,10 +194,92 @@ export function updateVerticalIntent(
     const lockoutComplete = safeNow - state.lastActionAt >= VERTICAL_INTENT_TUNING.jumpActionLockoutMs
     const neutralConfirmed = neutralSince !== null &&
       safeNow - neutralSince >= VERTICAL_INTENT_TUNING.neutralConfirmationMs
+
+    // Jump retrigger protection and crouch availability are separate concerns.
+    // A credible downward landing movement may begin crouch classification while
+    // lastActionAt continues to protect the already-triggered jump.
+    const postJumpCrouchEntry =
+      direction === 'down' &&
+      state.velocity >= VERTICAL_INTENT_TUNING.postJumpCrouchMinimumDownwardVelocity &&
+      displacement >= VERTICAL_INTENT_TUNING.postJumpCrouchEntryThreshold
+    if (postJumpCrouchEntry) {
+      return result({
+        ...state,
+        phase: 'postJumpCrouchPreparation',
+        movementStartedAt: safeNow,
+        deepSince: displacement >= VERTICAL_INTENT_TUNING.deliberateCrouchDepth
+          ? safeNow
+          : null,
+        maxDownwardDepth: displacement,
+        neutralSince: null,
+        reversalDetected: false,
+      }, direction)
+    }
+
     if (lockoutComplete && neutralConfirmed) {
       return result(neutralState({ ...state, neutralSince }, safeNow), direction)
     }
     return result({ ...state, neutralSince }, direction)
+  }
+
+  if (state.phase === 'postJumpCrouchPreparation') {
+    const beganAt = state.movementStartedAt ?? safeNow
+    const maxDownwardDepth = Math.max(state.maxDownwardDepth, displacement)
+    const atDeliberateDepth =
+      displacement >= VERTICAL_INTENT_TUNING.deliberateCrouchDepth
+    const deepSince = atDeliberateDepth
+      ? (state.deepSince ?? safeNow)
+      : null
+
+    if (
+      deepSince !== null &&
+      safeNow - deepSince >= VERTICAL_INTENT_TUNING.postJumpCrouchConfirmationMs
+    ) {
+      return result({
+        ...state,
+        phase: 'crouched',
+        movementStartedAt: beganAt,
+        deepSince,
+        maxDownwardDepth,
+        neutralSince: null,
+        // Preserve lastActionAt: it still represents the preceding jump and
+        // remains available to duplicate-jump protection during this chain.
+        reversalDetected: false,
+      }, direction, { crouchStarted: true })
+    }
+
+    const neutralSince = nearNeutral ? (state.neutralSince ?? safeNow) : null
+    const lockoutComplete =
+      safeNow - state.lastActionAt >= VERTICAL_INTENT_TUNING.jumpActionLockoutMs
+    const neutralConfirmed = neutralSince !== null &&
+      safeNow - neutralSince >= VERTICAL_INTENT_TUNING.neutralConfirmationMs
+    const returnedTowardNeutral =
+      displacement <= VERTICAL_INTENT_TUNING.postJumpCrouchCancelThreshold &&
+      direction !== 'down'
+    const transitionExpired =
+      safeNow - beganAt > VERTICAL_INTENT_TUNING.postJumpCrouchMaximumPreparationMs
+
+    if (returnedTowardNeutral || transitionExpired) {
+      if (lockoutComplete && neutralConfirmed) {
+        return result(neutralState({ ...state, neutralSince }, safeNow), direction)
+      }
+      return result({
+        ...state,
+        phase: 'jumpCooldown',
+        movementStartedAt: null,
+        deepSince: null,
+        maxDownwardDepth: 0,
+        neutralSince,
+        reversalDetected: false,
+      }, direction)
+    }
+
+    return result({
+      ...state,
+      deepSince,
+      maxDownwardDepth,
+      neutralSince,
+    }, direction)
   }
 
   if (state.phase === 'crouchJumpPreparation') {
