@@ -5,11 +5,14 @@ import {
   applyHorizontalSensitivity,
   normalizeHorizontalSensitivity,
   resolveAbsoluteLane,
-  updateCrouchGate,
-  updateJumpGate,
-  type JumpGateState,
 } from '../game/poseControlModel'
 import type { CalibrationBaseline, PoseSignal, RunnerLane } from '../game/types'
+import {
+  createVerticalIntentState,
+  normalizeVerticalDisplacement,
+  sanitizeTorsoSize,
+  updateVerticalIntent,
+} from '../game/verticalIntentModel'
 
 export type CameraStatus = 'off' | 'requesting' | 'ready' | 'calibrating' | 'active' | 'error'
 
@@ -59,11 +62,10 @@ export function usePoseControls({
   const statusRef = useRef<CameraStatus>('off')
   const baselineRef = useRef<CalibrationBaseline | null>(null)
   const filteredRef = useRef<{ x: number; y: number; at: number } | null>(null)
-  const calibrationRef = useRef<{ started: number; x: number[]; y: number[] } | null>(null)
+  const calibrationRef = useRef<{ started: number; x: number[]; y: number[]; torso: number[] } | null>(null)
   const laneRef = useRef<RunnerLane>(1)
   const crouchingRef = useRef(false)
-  const crouchEnterFramesRef = useRef(0)
-  const jumpGateRef = useRef<JumpGateState>({ armed: true, neutralFrames: 0 })
+  const verticalIntentRef = useRef(createVerticalIntentState())
   const unreliableFramesRef = useRef(0)
   const lastUiUpdateRef = useRef(0)
   const onLaneTargetRef = useRef(onLaneTarget)
@@ -144,10 +146,10 @@ export function usePoseControls({
     unreliableFramesRef.current += 1
     if (
       unreliableFramesRef.current >= TRACKING_LOSS_RELEASE_FRAMES &&
-      crouchingRef.current
+      (crouchingRef.current || verticalIntentRef.current.phase !== 'neutral')
     ) {
       crouchingRef.current = false
-      crouchEnterFramesRef.current = 0
+      verticalIntentRef.current = createVerticalIntentState(now)
       onCrouchChangeRef.current(false)
     }
 
@@ -180,6 +182,8 @@ export function usePoseControls({
     const rawCenterX = average(indices.map((index) => landmarks[index].x))
     const mirroredCenterX = 1 - rawCenterX
     const shoulderY = average([landmarks[11].y, landmarks[12].y])
+    const hipY = average([landmarks[23].y, landmarks[24].y])
+    const torsoSize = sanitizeTorsoSize(hipY - shoulderY)
     const previous = filteredRef.current
     const deltaSeconds = previous ? (now - previous.at) / 1000 : 1 / 30
     const filtered = previous
@@ -206,6 +210,7 @@ export function usePoseControls({
       if (!calibration) return
       calibration.x.push(filtered.x)
       calibration.y.push(filtered.y)
+      calibration.torso.push(torsoSize)
       const progress = Math.min(1, (now - calibration.started) / CALIBRATION_MS)
       if (now - lastUiUpdateRef.current > 66) {
         lastUiUpdateRef.current = now
@@ -216,11 +221,11 @@ export function usePoseControls({
         baselineRef.current = {
           centerX: average(calibration.x.slice(-30)),
           shoulderY: average(calibration.y.slice(-30)),
+          torsoSize: sanitizeTorsoSize(average(calibration.torso.slice(-30))),
         }
         laneRef.current = 1
         crouchingRef.current = false
-        crouchEnterFramesRef.current = 0
-        jumpGateRef.current = { armed: true, neutralFrames: 0 }
+        verticalIntentRef.current = createVerticalIntentState(now)
         calibrationRef.current = null
         onLaneTargetRef.current(1)
         onCrouchChangeRef.current(false)
@@ -247,7 +252,10 @@ export function usePoseControls({
       rawDeltaX,
       horizontalSensitivityRef.current,
     )
-    const deltaY = filtered.y - baseline.shoulderY
+    const deltaY = normalizeVerticalDisplacement(
+      filtered.y - baseline.shoulderY,
+      baseline.torsoSize,
+    )
     const previousLane = laneRef.current
     const nextLane = resolveAbsoluteLane(deltaX, previousLane)
     const laneChanged = nextLane !== previousLane
@@ -258,33 +266,21 @@ export function usePoseControls({
     onLaneTargetRef.current(nextLane)
 
     const wasCrouching = crouchingRef.current
-    const crouchResult = updateCrouchGate(deltaY, {
-      crouching: crouchingRef.current,
-      enterFrames: crouchEnterFramesRef.current,
-    })
-    crouchingRef.current = crouchResult.crouching
-    crouchEnterFramesRef.current = crouchResult.enterFrames
+    const verticalIntent = updateVerticalIntent(deltaY, now, verticalIntentRef.current)
+    verticalIntentRef.current = verticalIntent.state
+    crouchingRef.current = verticalIntent.crouching
     const crouchChanged = crouchingRef.current !== wasCrouching
 
     // Like lane position, crouch is a continuously refreshed held state.
     onCrouchChangeRef.current(crouchingRef.current)
 
-    const jumpResult = updateJumpGate(
-      deltaY,
-      jumpGateRef.current,
-      crouchingRef.current,
-    )
-    jumpGateRef.current = {
-      armed: jumpResult.armed,
-      neutralFrames: jumpResult.neutralFrames,
-    }
-    if (jumpResult.triggered) onJumpRef.current()
+    if (verticalIntent.jumpTriggered) onJumpRef.current()
 
-    const urgentUiUpdate = laneChanged || crouchChanged || jumpResult.triggered
+    const urgentUiUpdate = laneChanged || crouchChanged || verticalIntent.jumpTriggered
     if (urgentUiUpdate || now - lastUiUpdateRef.current > 66) {
       lastUiUpdateRef.current = now
       setMessage(
-        jumpResult.triggered
+        verticalIntent.jumpTriggered
           ? 'JUMP'
           : crouchingRef.current
             ? 'CROUCH'
@@ -296,7 +292,7 @@ export function usePoseControls({
         confidence,
         lane: nextLane,
         crouching: crouchingRef.current,
-        jumpTriggered: jumpResult.triggered,
+        jumpTriggered: verticalIntent.jumpTriggered,
       })
     }
   }, [publishTrackingLoss, setStatus])
@@ -395,13 +391,13 @@ export function usePoseControls({
 
   const calibrate = useCallback(() => {
     if (statusRef.current !== 'ready' && statusRef.current !== 'active') return
+    const now = performance.now()
     baselineRef.current = null
     filteredRef.current = null
     laneRef.current = 1
     crouchingRef.current = false
-    crouchEnterFramesRef.current = 0
-    jumpGateRef.current = { armed: true, neutralFrames: 0 }
-    calibrationRef.current = { started: performance.now(), x: [], y: [] }
+    verticalIntentRef.current = createVerticalIntentState(now)
+    calibrationRef.current = { started: now, x: [], y: [], torso: [] }
     onCrouchChangeRef.current(false)
     setCalibrationProgress(0)
     setStatus('calibrating')
@@ -419,8 +415,7 @@ export function usePoseControls({
     calibrationRef.current = null
     laneRef.current = 1
     crouchingRef.current = false
-    crouchEnterFramesRef.current = 0
-    jumpGateRef.current = { armed: true, neutralFrames: 0 }
+    verticalIntentRef.current = createVerticalIntentState()
     unreliableFramesRef.current = 0
     onCrouchChangeRef.current(false)
     const video = videoRef.current

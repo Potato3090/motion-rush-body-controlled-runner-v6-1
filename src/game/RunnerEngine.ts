@@ -1,5 +1,16 @@
 import * as THREE from 'three'
 import type { GameSnapshot, GameStatus, RunnerAction, RunnerLane } from './types'
+import {
+  JUMP_CLEARANCE_HEIGHT,
+  LANDING_TOTAL_DURATION,
+  TAKEOFF_POSE_DURATION,
+  createGroundedJumpMotion,
+  getJumpPhase,
+  getLandingCompression,
+  stepJumpMotion,
+  tryStartJump,
+  type JumpPhase,
+} from './jumpMotion'
 
 type HazardKind = 'block' | 'jump' | 'slide'
 
@@ -69,6 +80,7 @@ export class RunnerEngine {
   private readonly hazards: Hazard[] = []
   private readonly coins: Coin[] = []
   private readonly player = new THREE.Group()
+  private playerShadow?: THREE.Mesh
   private readonly playerParts: {
     leftArm?: THREE.Object3D
     rightArm?: THREE.Object3D
@@ -81,8 +93,8 @@ export class RunnerEngine {
   private status: GameStatus = 'menu'
   private laneIndex: RunnerLane = 1
   private targetX = 0
-  private verticalVelocity = 0
-  private jumpHeight = 0
+  private jumpMotion = createGroundedJumpMotion()
+  private landingElapsed = LANDING_TOTAL_DURATION
   private fallbackSlideTimer = 0
   private cameraCrouching = false
   private manualCrouching = false
@@ -135,8 +147,8 @@ export class RunnerEngine {
     this.elapsed = 0
     this.laneIndex = 1
     this.targetX = 0
-    this.jumpHeight = 0
-    this.verticalVelocity = 0
+    this.jumpMotion = createGroundedJumpMotion()
+    this.landingElapsed = LANDING_TOTAL_DURATION
     this.fallbackSlideTimer = 0
     this.cameraCrouching = false
     this.manualCrouching = false
@@ -160,11 +172,13 @@ export class RunnerEngine {
       this.targetX = LANES[this.laneIndex]
       return
     }
-    if (action === 'jump' && this.jumpHeight <= 0.02 && !this.isCrouching()) {
-      this.verticalVelocity = 10.8
+    if (action === 'jump' && !this.isCrouching()) {
+      const jumpRequest = tryStartJump(this.jumpMotion)
+      this.jumpMotion = jumpRequest.state
+      if (jumpRequest.started) this.landingElapsed = LANDING_TOTAL_DURATION
       return
     }
-    if (action === 'slide' && this.jumpHeight <= 0.12) {
+    if (action === 'slide' && !this.jumpMotion.airborne) {
       this.fallbackSlideTimer = 0.72
     }
   }
@@ -326,8 +340,9 @@ export class RunnerEngine {
       new THREE.MeshBasicMaterial({ color: 0x0d0920, transparent: true, opacity: 0.34, depthWrite: false }),
     )
     shadow.rotation.x = -Math.PI / 2
-    shadow.position.y = 0.05
-    this.player.add(shadow)
+    shadow.position.set(0, 0.05, PLAYER_Z)
+    this.playerShadow = shadow
+    this.scene.add(shadow)
 
     const torso = mesh(new THREE.CapsuleGeometry(0.62, 0.88, 5, 10), palette.coral)
     torso.position.y = 2.25
@@ -530,7 +545,13 @@ export class RunnerEngine {
     this.elapsed += delta * 0.42
     const stride = Math.sin(this.elapsed * 4.2) * 0.08
     this.player.position.y = Math.max(0, stride)
+    const poseBlend = 1 - Math.exp(-delta * 18)
+    this.player.scale.x = THREE.MathUtils.lerp(this.player.scale.x, 1, poseBlend)
+    this.player.scale.y = THREE.MathUtils.lerp(this.player.scale.y, 1, poseBlend)
+    this.player.scale.z = THREE.MathUtils.lerp(this.player.scale.z, 1, poseBlend)
+    this.player.rotation.x = THREE.MathUtils.lerp(this.player.rotation.x, 0, poseBlend)
     this.animateLimbs(this.elapsed * 4.2, 0.22)
+    this.updatePlayerShadow(0, 0)
     this.coins.forEach((coin) => {
       coin.mesh.rotation.y += delta * 2.1
       coin.mesh.rotation.z = Math.sin(this.elapsed * 2 + coin.mesh.position.z) * 0.12
@@ -568,28 +589,144 @@ export class RunnerEngine {
     this.player.position.x += xDelta * Math.min(1, delta * 17.5)
     this.player.rotation.z = THREE.MathUtils.lerp(this.player.rotation.z, -xDelta * 0.07, Math.min(1, delta * 18))
 
-    if (this.jumpHeight > 0 || this.verticalVelocity > 0) {
-      this.verticalVelocity -= 25.5 * delta
-      this.jumpHeight = Math.max(0, this.jumpHeight + this.verticalVelocity * delta)
-      if (this.jumpHeight === 0) this.verticalVelocity = 0
+    const jumpStep = stepJumpMotion(this.jumpMotion, delta)
+    this.jumpMotion = jumpStep.state
+    if (jumpStep.landed) this.landingElapsed = 0
+    else if (!this.jumpMotion.airborne) {
+      this.landingElapsed = Math.min(LANDING_TOTAL_DURATION, this.landingElapsed + delta)
     }
 
     this.fallbackSlideTimer = Math.max(0, this.fallbackSlideTimer - delta)
-    const sliding = this.isCrouching()
-    const targetScaleY = sliding ? 0.48 : 1
-    this.player.scale.y = THREE.MathUtils.lerp(this.player.scale.y, targetScaleY, Math.min(1, delta * 18))
-    this.player.position.y = this.jumpHeight
-    this.player.rotation.x = THREE.MathUtils.lerp(this.player.rotation.x, sliding ? -0.18 : 0, Math.min(1, delta * 14))
-    this.animateLimbs(this.elapsed * (9.5 + this.speed * 0.08), sliding ? 0.18 : 0.72)
+    const sliding = this.isCrouching() && !this.jumpMotion.airborne
+    const jumpPhase = getJumpPhase(this.jumpMotion)
+    const landingCompression = getLandingCompression(this.landingElapsed)
+    const takeoffProgress = jumpPhase === 'takeoff'
+      ? Math.min(1, this.jumpMotion.elapsed / TAKEOFF_POSE_DURATION)
+      : 1
+    const takeoffCompression = jumpPhase === 'takeoff'
+      ? Math.sin(takeoffProgress * Math.PI) * 0.075
+      : 0
+    const targetScaleY = sliding
+      ? 0.48
+      : 1 - takeoffCompression - landingCompression * 0.14
+    const targetScaleXZ = 1 + takeoffCompression * 0.45 + landingCompression * 0.055
+    const scaleBlend = 1 - Math.exp(-delta * 28)
+    this.player.scale.y = THREE.MathUtils.lerp(this.player.scale.y, targetScaleY, scaleBlend)
+    this.player.scale.x = THREE.MathUtils.lerp(this.player.scale.x, targetScaleXZ, scaleBlend)
+    this.player.scale.z = THREE.MathUtils.lerp(this.player.scale.z, targetScaleXZ, scaleBlend)
+    const motionRecovered =
+      !sliding &&
+      !this.jumpMotion.airborne &&
+      this.landingElapsed >= LANDING_TOTAL_DURATION
+    if (motionRecovered) this.player.scale.set(1, 1, 1)
+
+    this.player.position.y = this.jumpMotion.height
+    const airbornePitch = jumpPhase === 'takeoff'
+      ? -0.1
+      : jumpPhase === 'rising'
+        ? -0.055
+        : jumpPhase === 'falling'
+          ? 0.065
+          : 0
+    const targetPitch = sliding ? -0.18 : airbornePitch + landingCompression * 0.055
+    this.player.rotation.x = THREE.MathUtils.lerp(
+      this.player.rotation.x,
+      targetPitch,
+      1 - Math.exp(-delta * 20),
+    )
+    if (motionRecovered) this.player.rotation.x = 0
+
+    if (this.jumpMotion.airborne) this.animateAirbornePose(jumpPhase)
+    else if (landingCompression > 0) this.animateLandingPose(landingCompression)
+    else this.animateLimbs(this.elapsed * (9.5 + this.speed * 0.08), sliding ? 0.18 : 0.72)
+    this.updatePlayerShadow(this.jumpMotion.height, landingCompression)
   }
 
   private animateLimbs(phase: number, amount: number) {
     const swing = Math.sin(phase) * amount
-    if (this.playerParts.leftArm) this.playerParts.leftArm.rotation.x = swing
-    if (this.playerParts.rightArm) this.playerParts.rightArm.rotation.x = -swing
-    if (this.playerParts.leftLeg) this.playerParts.leftLeg.rotation.x = -swing * 0.85
-    if (this.playerParts.rightLeg) this.playerParts.rightLeg.rotation.x = swing * 0.85
-    if (this.playerParts.torso) this.playerParts.torso.rotation.y = Math.sin(phase) * 0.045
+    if (this.playerParts.leftArm) {
+      this.playerParts.leftArm.position.y = 2.25
+      this.playerParts.leftArm.rotation.x = swing
+    }
+    if (this.playerParts.rightArm) {
+      this.playerParts.rightArm.position.y = 2.25
+      this.playerParts.rightArm.rotation.x = -swing
+    }
+    if (this.playerParts.leftLeg) {
+      this.playerParts.leftLeg.position.y = 0.75
+      this.playerParts.leftLeg.rotation.x = -swing * 0.85
+    }
+    if (this.playerParts.rightLeg) {
+      this.playerParts.rightLeg.position.y = 0.75
+      this.playerParts.rightLeg.rotation.x = swing * 0.85
+    }
+    if (this.playerParts.torso) {
+      this.playerParts.torso.rotation.x = 0
+      this.playerParts.torso.rotation.y = Math.sin(phase) * 0.045
+    }
+  }
+
+  private animateAirbornePose(phase: JumpPhase) {
+    const ascentAmount = phase === 'takeoff' ? 0.35 : phase === 'rising' ? 1 : phase === 'apex' ? 0.9 : 0.35
+    const tuckAmount = phase === 'takeoff' ? 0.25 : phase === 'rising' ? 0.82 : phase === 'apex' ? 1 : 0.42
+    const falling = phase === 'falling'
+
+    if (this.playerParts.leftArm) {
+      this.playerParts.leftArm.position.y = 2.25 + ascentAmount * 0.1
+      this.playerParts.leftArm.rotation.x = falling ? 0.22 : -0.95 * ascentAmount
+    }
+    if (this.playerParts.rightArm) {
+      this.playerParts.rightArm.position.y = 2.25 + ascentAmount * 0.1
+      this.playerParts.rightArm.rotation.x = falling ? 0.08 : -0.78 * ascentAmount
+    }
+    if (this.playerParts.leftLeg) {
+      this.playerParts.leftLeg.position.y = 0.75 + tuckAmount * 0.18
+      this.playerParts.leftLeg.rotation.x = falling ? -0.2 : 0.62 * tuckAmount
+    }
+    if (this.playerParts.rightLeg) {
+      this.playerParts.rightLeg.position.y = 0.75 + tuckAmount * 0.14
+      this.playerParts.rightLeg.rotation.x = falling ? 0.32 : -0.48 * tuckAmount
+    }
+    if (this.playerParts.torso) {
+      this.playerParts.torso.rotation.x = falling ? 0.045 : -0.035 * ascentAmount
+      this.playerParts.torso.rotation.y = 0
+    }
+  }
+
+  private animateLandingPose(compression: number) {
+    if (this.playerParts.leftArm) {
+      this.playerParts.leftArm.position.y = 2.25 - compression * 0.06
+      this.playerParts.leftArm.rotation.x = 0.28 * compression
+    }
+    if (this.playerParts.rightArm) {
+      this.playerParts.rightArm.position.y = 2.25 - compression * 0.06
+      this.playerParts.rightArm.rotation.x = -0.18 * compression
+    }
+    if (this.playerParts.leftLeg) {
+      this.playerParts.leftLeg.position.y = 0.75 - compression * 0.08
+      this.playerParts.leftLeg.rotation.x = -0.2 * compression
+    }
+    if (this.playerParts.rightLeg) {
+      this.playerParts.rightLeg.position.y = 0.75 - compression * 0.08
+      this.playerParts.rightLeg.rotation.x = 0.2 * compression
+    }
+    if (this.playerParts.torso) {
+      this.playerParts.torso.rotation.x = 0.075 * compression
+      this.playerParts.torso.rotation.y = 0
+    }
+  }
+
+  private updatePlayerShadow(jumpHeight: number, landingCompression: number) {
+    const shadow = this.playerShadow
+    if (!shadow) return
+    shadow.position.x = this.player.position.x
+    const heightRatio = Math.min(1, jumpHeight / 2)
+    const scale = 1 - heightRatio * 0.3 + landingCompression * 0.055
+    shadow.scale.setScalar(scale)
+    const material = shadow.material
+    if (material instanceof THREE.MeshBasicMaterial) {
+      material.opacity = 0.34 - heightRatio * 0.13 + landingCompression * 0.035
+    }
   }
 
   private checkCollisions() {
@@ -601,7 +738,7 @@ export class RunnerEngine {
       if (zDistance < 1.36 && xDistance < 1.08) {
         const sliding = this.isCrouching()
         const safe =
-          (hazard.kind === 'jump' && this.jumpHeight > 1.0) ||
+          (hazard.kind === 'jump' && this.jumpMotion.height > JUMP_CLEARANCE_HEIGHT) ||
           (hazard.kind === 'slide' && sliding)
         if (!safe) {
           hazard.hit = true
@@ -618,7 +755,7 @@ export class RunnerEngine {
       if (
         Math.abs(coin.mesh.position.z - PLAYER_Z) < 1.18 &&
         Math.abs(coin.mesh.position.x - playerX) < 0.92 &&
-        Math.abs(coin.mesh.position.y - (this.jumpHeight + 1.05)) < 1.45
+        Math.abs(coin.mesh.position.y - (this.jumpMotion.height + 1.05)) < 1.45
       ) {
         coin.collected = true
         coin.mesh.visible = false

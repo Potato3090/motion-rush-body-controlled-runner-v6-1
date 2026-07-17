@@ -5,9 +5,14 @@ import {
   applyHorizontalSensitivity,
   normalizeHorizontalSensitivity,
   resolveAbsoluteLane,
-  updateCrouchGate,
-  updateJumpGate,
 } from '../.control-test-build/poseControlModel.js'
+import {
+  VERTICAL_INTENT_TUNING,
+  createVerticalIntentState,
+  normalizeVerticalDisplacement,
+  sanitizeTorsoSize,
+  updateVerticalIntent,
+} from '../.control-test-build/verticalIntentModel.js'
 
 // Fine-step sensitivity, clamping, center preservation, and shared processed
 // signal behavior for both the tracking dot and absolute lane model.
@@ -77,34 +82,128 @@ assert.equal(adaptivePoseSmooth(0, 0.001, 1 / 30, {
   deadband: 0.0014,
 }), 0, 'sub-deadband jitter should be ignored')
 
-// Crouch requires only two reliable enter frames, remains held indefinitely,
-// and exits on the first real stand-up frame.
-let crouch = { crouching: false, enterFrames: 0 }
-crouch = updateCrouchGate(0.06, crouch)
-assert.deepEqual(crouch, { crouching: false, enterFrames: 1 })
-crouch = updateCrouchGate(0.061, crouch)
-assert.deepEqual(crouch, { crouching: true, enterFrames: 0 })
-for (let frame = 0; frame < 180; frame += 1) crouch = updateCrouchGate(0.055, crouch)
-assert.equal(crouch.crouching, true, 'crouch must not time out')
-crouch = updateCrouchGate(0.038, crouch)
-assert.equal(crouch.crouching, false, 'standing should release crouch immediately')
+function createVerticalDriver(frameMs = 1000 / 30) {
+  let now = 0
+  let state = createVerticalIntentState(now)
+  const events = { jumps: 0, crouchStarts: 0, crouchEnds: 0, phases: [], crouching: [] }
+  return {
+    events,
+    feed(values) {
+      for (const value of values) {
+        now += frameMs
+        const next = updateVerticalIntent(value, now, state)
+        state = next.state
+        if (next.jumpTriggered) events.jumps += 1
+        if (next.crouchStarted) events.crouchStarts += 1
+        if (next.crouchEnded) events.crouchEnds += 1
+        events.phases.push(next.state.phase)
+        events.crouching.push(next.crouching)
+      }
+      return state
+    },
+    get state() { return state },
+  }
+}
 
-// One takeoff triggers once. No timer is involved; two neutral landing frames
-// rearm the next physical jump, while minor vertical movement never triggers.
-let jump = { armed: true, neutralFrames: 0 }
-let jumpResult = updateJumpGate(-0.053, jump, false)
-assert.equal(jumpResult.triggered, true)
-jump = { armed: jumpResult.armed, neutralFrames: jumpResult.neutralFrames }
-jumpResult = updateJumpGate(-0.08, jump, false)
-assert.equal(jumpResult.triggered, false)
-jump = { armed: jumpResult.armed, neutralFrames: jumpResult.neutralFrames }
-jumpResult = updateJumpGate(0, jump, false)
-assert.equal(jumpResult.armed, false)
-jump = { armed: jumpResult.armed, neutralFrames: jumpResult.neutralFrames }
-jumpResult = updateJumpGate(0.002, jump, false)
-assert.equal(jumpResult.armed, true)
-jump = { armed: jumpResult.armed, neutralFrames: jumpResult.neutralFrames }
-jumpResult = updateJumpGate(-0.03, jump, false)
-assert.equal(jumpResult.triggered, false)
+function sampleKeyframes(keyframes, fps) {
+  const frameMs = 1000 / fps
+  const values = []
+  const end = keyframes[keyframes.length - 1][0]
+  for (let time = 0; time <= end + 0.001; time += frameMs) {
+    let segment = 0
+    while (segment < keyframes.length - 2 && time > keyframes[segment + 1][0]) segment += 1
+    const [startTime, startValue] = keyframes[segment]
+    const [endTime, endValue] = keyframes[segment + 1]
+    const progress = Math.max(0, Math.min(1, (time - startTime) / Math.max(1, endTime - startTime)))
+    values.push(startValue + (endValue - startValue) * progress)
+  }
+  return values
+}
+
+// Torso normalization produces the same intent displacement at different
+// calibrated camera distances and safely rejects invalid measurements.
+assert.equal(sanitizeTorsoSize(0), VERTICAL_INTENT_TUNING.torsoFallback)
+assert.equal(sanitizeTorsoSize(Number.NaN), VERTICAL_INTENT_TUNING.torsoFallback)
+assert.equal(sanitizeTorsoSize(0.9), VERTICAL_INTENT_TUNING.torsoMaximum)
+assert.ok(Math.abs(normalizeVerticalDisplacement(0.064, 0.2) - 0.32) < 1e-9)
+assert.ok(Math.abs(normalizeVerticalDisplacement(0.096, 0.3) - 0.32) < 1e-9)
+
+// 1. A shallow preparatory dip followed by a fast rise becomes exactly one
+// jump, passes through jumpPreparation, and never emits crouch.
+const preparatoryJump = createVerticalDriver()
+preparatoryJump.feed([0, 0.06, 0.12, 0.19, 0.17, 0.09, -0.05, -0.16, -0.2])
+assert.equal(preparatoryJump.events.jumps, 1)
+assert.equal(preparatoryJump.events.crouchStarts, 0)
+assert.ok(preparatoryJump.events.phases.includes('jumpPreparation'))
+
+// 2. A shallow dip that merely returns to neutral produces no action.
+const accidentalDip = createVerticalDriver()
+accidentalDip.feed([0, 0.05, 0.12, 0.15, 0.11, 0.06, 0.02, 0, 0])
+assert.equal(accidentalDip.events.jumps, 0)
+assert.equal(accidentalDip.events.crouchStarts, 0)
+
+// 3. A deep, sustained dip confirms one held crouch, then exits and rearms
+// only after the player returns close to neutral.
+const deliberateCrouch = createVerticalDriver()
+deliberateCrouch.feed([0, 0.1, 0.22, 0.35, 0.39, 0.39, 0.39, 0.39, 0.39, 0.39])
+assert.equal(deliberateCrouch.events.crouchStarts, 1)
+assert.equal(deliberateCrouch.events.jumps, 0)
+assert.equal(deliberateCrouch.state.phase, 'crouched')
+deliberateCrouch.feed(Array(60).fill(0.4))
+assert.equal(deliberateCrouch.events.crouchStarts, 1, 'holding must not repeat crouch')
+deliberateCrouch.feed([0.27, 0.14, 0.07, 0.04, 0, 0])
+assert.equal(deliberateCrouch.events.crouchEnds, 1)
+assert.equal(deliberateCrouch.state.phase, 'neutral')
+
+// 4. A direct fast upward takeoff works without requiring a preparatory dip.
+const directJump = createVerticalDriver()
+directJump.feed([0, -0.05, -0.15, -0.24])
+assert.equal(directJump.events.jumps, 1)
+
+// 5. Landmark-sized threshold noise never leaves neutral or emits actions.
+const noise = createVerticalDriver()
+noise.feed(Array.from({ length: 120 }, (_, index) => [0.035, -0.028, 0.018, -0.012][index % 4]))
+assert.equal(noise.events.jumps, 0)
+assert.equal(noise.events.crouchStarts, 0)
+assert.equal(noise.state.phase, 'neutral')
+
+// 6/7. One physical jump cannot retrigger while locked; neutral recovery rearms
+// a later real jump.
+const jumpRearm = createVerticalDriver()
+jumpRearm.feed([0, -0.06, -0.16, -0.24, -0.22, -0.18, -0.24])
+assert.equal(jumpRearm.events.jumps, 1)
+jumpRearm.feed(Array(12).fill(0))
+jumpRearm.feed([-0.05, -0.16, -0.24])
+assert.equal(jumpRearm.events.jumps, 2)
+
+// 8/9. Crouch enters once per hold and can enter again only after a full
+// neutral rearm.
+const crouchRearm = createVerticalDriver()
+const deepHold = [0.12, 0.24, 0.35, 0.39, 0.39, 0.39, 0.39, 0.39]
+crouchRearm.feed(deepHold)
+crouchRearm.feed(Array(20).fill(0.4))
+assert.equal(crouchRearm.events.crouchStarts, 1)
+crouchRearm.feed([0.24, 0.14, 0.07, 0.03, 0, 0, 0])
+crouchRearm.feed(deepHold)
+assert.equal(crouchRearm.events.crouchStarts, 2)
+
+// Millisecond timing and velocity normalization make intent classification
+// consistent across realistic camera callback rates.
+for (const fps of [24, 30, 60]) {
+  const frameMs = 1000 / fps
+  const jumpAtRate = createVerticalDriver(frameMs)
+  jumpAtRate.feed(sampleKeyframes([
+    [0, 0], [90, 0.18], [145, 0.16], [220, -0.08], [280, -0.18],
+  ], fps))
+  assert.equal(jumpAtRate.events.jumps, 1, `preparatory jump at ${fps} FPS`)
+  assert.equal(jumpAtRate.events.crouchStarts, 0, `no preparatory slide at ${fps} FPS`)
+
+  const crouchAtRate = createVerticalDriver(frameMs)
+  crouchAtRate.feed(sampleKeyframes([
+    [0, 0], [120, 0.38], [320, 0.4], [430, 0.4], [540, 0.04], [680, 0],
+  ], fps))
+  assert.equal(crouchAtRate.events.crouchStarts, 1, `deliberate crouch at ${fps} FPS`)
+  assert.equal(crouchAtRate.events.jumps, 0, `no crouch jump at ${fps} FPS`)
+}
 
 console.log('Camera control model: all acceptance checks passed.')

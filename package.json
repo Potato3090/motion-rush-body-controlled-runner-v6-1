@@ -1,12 +1,12 @@
 {
-  "name": "motion-rush-v3",
+  "name": "motion-rush-v4",
   "private": true,
-  "version": "3.0.0",
+  "version": "4.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test:controls": "tsc src/game/poseControlModel.ts src/game/settings.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/poseControlModel.mjs",
+    "test:controls": "tsc src/game/poseControlModel.ts src/game/settings.ts src/game/verticalIntentModel.ts src/game/jumpMotion.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/poseControlModel.mjs && node tests/runnerMotion.mjs",
     "start": "vite preview --host 0.0.0.0 --port 3000",
     "preview": "vite preview"
   },

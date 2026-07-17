@@ -26,4 +26,5 @@ export interface PoseSignal {
 export interface CalibrationBaseline {
   centerX: number
   shoulderY: number
+  torsoSize: number
 }

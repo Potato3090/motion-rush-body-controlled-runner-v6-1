@@ -3,12 +3,6 @@ import type { RunnerLane } from './types'
 export const POSE_TUNING = {
   laneEnter: 0.055,
   laneExit: 0.037,
-  crouchEnter: 0.058,
-  crouchExit: 0.039,
-  crouchEnterFrames: 2,
-  jumpTakeoff: -0.052,
-  jumpRearm: -0.018,
-  jumpNeutralFrames: 2,
 } as const
 
 export const HORIZONTAL_SENSITIVITY = {
@@ -18,20 +12,6 @@ export const HORIZONTAL_SENSITIVITY = {
   default: 1,
   maxProcessedOffset: 0.1,
 } as const
-
-export interface JumpGateState {
-  armed: boolean
-  neutralFrames: number
-}
-
-export interface JumpGateResult extends JumpGateState {
-  triggered: boolean
-}
-
-export interface CrouchGateState {
-  crouching: boolean
-  enterFrames: number
-}
 
 export function normalizeHorizontalSensitivity(value: number): number {
   if (!Number.isFinite(value)) return HORIZONTAL_SENSITIVITY.default
@@ -70,59 +50,6 @@ export function resolveAbsoluteLane(
   if (currentLane === 0 && horizontalOffset < -POSE_TUNING.laneExit) return 0
   if (currentLane === 2 && horizontalOffset > POSE_TUNING.laneExit) return 2
   return 1
-}
-
-/** A held state with separate enter/exit thresholds to avoid edge flicker. */
-export function resolveCrouchState(
-  verticalOffset: number,
-  isCrouching: boolean,
-): boolean {
-  return isCrouching
-    ? verticalOffset > POSE_TUNING.crouchExit
-    : verticalOffset >= POSE_TUNING.crouchEnter
-}
-
-/** Two-frame enter confirmation and immediate thresholded exit. */
-export function updateCrouchGate(
-  verticalOffset: number,
-  state: CrouchGateState,
-): CrouchGateState {
-  const wantsCrouch = resolveCrouchState(verticalOffset, state.crouching)
-  if (state.crouching) {
-    return wantsCrouch ? state : { crouching: false, enterFrames: 0 }
-  }
-  if (!wantsCrouch) return { crouching: false, enterFrames: 0 }
-
-  const enterFrames = state.enterFrames + 1
-  return {
-    crouching: enterFrames >= POSE_TUNING.crouchEnterFrames,
-    enterFrames: enterFrames >= POSE_TUNING.crouchEnterFrames ? 0 : enterFrames,
-  }
-}
-
-/**
- * A timer-free jump gate. One upward takeoff disarms the gate; returning to a
- * neutral height for two reliable frames rearms it for the next real jump.
- */
-export function updateJumpGate(
-  verticalOffset: number,
-  state: JumpGateState,
-  isCrouching: boolean,
-): JumpGateResult {
-  if (state.armed) {
-    if (!isCrouching && verticalOffset <= POSE_TUNING.jumpTakeoff) {
-      return { armed: false, neutralFrames: 0, triggered: true }
-    }
-    return { ...state, triggered: false }
-  }
-
-  const isNeutral = verticalOffset >= POSE_TUNING.jumpRearm && !isCrouching
-  const neutralFrames = isNeutral ? state.neutralFrames + 1 : 0
-  return {
-    armed: neutralFrames >= POSE_TUNING.jumpNeutralFrames,
-    neutralFrames,
-    triggered: false,
-  }
 }
 
 /**
