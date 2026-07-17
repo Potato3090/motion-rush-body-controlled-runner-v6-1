@@ -85,7 +85,14 @@ assert.equal(adaptivePoseSmooth(0, 0.001, 1 / 30, {
 function createVerticalDriver(frameMs = 1000 / 30) {
   let now = 0
   let state = createVerticalIntentState(now)
-  const events = { jumps: 0, crouchStarts: 0, crouchEnds: 0, phases: [], crouching: [] }
+  const events = {
+    jumps: 0,
+    crouchStarts: 0,
+    crouchEnds: 0,
+    phases: [],
+    crouching: [],
+    samples: [],
+  }
   return {
     events,
     feed(values) {
@@ -98,6 +105,15 @@ function createVerticalDriver(frameMs = 1000 / 30) {
         if (next.crouchEnded) events.crouchEnds += 1
         events.phases.push(next.state.phase)
         events.crouching.push(next.crouching)
+        events.samples.push({
+          now,
+          value,
+          phase: next.state.phase,
+          crouching: next.crouching,
+          jumpTriggered: next.jumpTriggered,
+          crouchStarted: next.crouchStarted,
+          crouchEnded: next.crouchEnded,
+        })
       }
       return state
     },
@@ -186,6 +202,85 @@ assert.equal(crouchRearm.events.crouchStarts, 1)
 crouchRearm.feed([0.24, 0.14, 0.07, 0.03, 0, 0, 0])
 crouchRearm.feed(deepHold)
 assert.equal(crouchRearm.events.crouchStarts, 2)
+
+// V5 regression 1: an explosive one-frame transition from a confirmed crouch
+// can end crouch and trigger exactly one jump atomically, with no neutral hold.
+const atomicCrouchJump = createVerticalDriver()
+atomicCrouchJump.feed([...deepHold, ...Array(8).fill(0.4)])
+assert.equal(atomicCrouchJump.state.phase, 'crouched')
+atomicCrouchJump.feed([-0.08])
+const atomicJumpSample = atomicCrouchJump.events.samples.find((sample) => sample.jumpTriggered)
+assert.equal(atomicCrouchJump.events.crouchStarts, 1)
+assert.equal(atomicCrouchJump.events.crouchEnds, 1)
+assert.equal(atomicCrouchJump.events.jumps, 1)
+assert.equal(atomicCrouchJump.state.phase, 'jumpCooldown')
+assert.equal(atomicJumpSample?.crouching, false)
+assert.equal(atomicJumpSample?.crouchEnded, true)
+assert.equal(atomicJumpSample?.value, -0.08)
+
+// V5 regression 2: a smooth ordinary stand ends crouch but never jumps and
+// completes the existing neutral rearm path.
+const ordinaryStand = createVerticalDriver()
+ordinaryStand.feed([...deepHold, ...Array(8).fill(0.4)])
+ordinaryStand.feed([0.32, 0.24, 0.18, 0.14, 0.09, 0.05, 0.02, ...Array(10).fill(0)])
+assert.equal(ordinaryStand.events.crouchStarts, 1)
+assert.equal(ordinaryStand.events.crouchEnds, 1)
+assert.equal(ordinaryStand.events.jumps, 0)
+assert.equal(ordinaryStand.state.phase, 'neutral')
+
+// V5 regression 3: a partial rise that never exits the held-crouch threshold
+// neither jumps nor generates crouch start/end spam.
+const partialCrouchRise = createVerticalDriver()
+partialCrouchRise.feed([...deepHold, ...Array(8).fill(0.4)])
+partialCrouchRise.feed([0.32, 0.25, 0.21, 0.18, 0.23, 0.31, 0.4, 0.4])
+assert.equal(partialCrouchRise.events.jumps, 0)
+assert.equal(partialCrouchRise.events.crouchStarts, 1)
+assert.equal(partialCrouchRise.events.crouchEnds, 0)
+assert.equal(partialCrouchRise.state.phase, 'crouched')
+
+const cancelledCrouchJump = createVerticalDriver()
+cancelledCrouchJump.feed([...deepHold, ...Array(8).fill(0.4)])
+cancelledCrouchJump.feed([0.12, 0.08, 0.12, 0.18, 0.26, 0.4])
+assert.equal(cancelledCrouchJump.events.jumps, 0)
+assert.equal(cancelledCrouchJump.events.crouchStarts, 1)
+assert.equal(cancelledCrouchJump.events.crouchEnds, 1)
+assert.ok(cancelledCrouchJump.events.phases.includes('crouchJumpPreparation'))
+assert.equal(cancelledCrouchJump.state.phase, 'crouched')
+
+// V5 regression 4: even a fast exit is only a stand when it stops near neutral
+// instead of continuing above the calibrated neutral position.
+const fastStand = createVerticalDriver()
+fastStand.feed([...deepHold, ...Array(8).fill(0.4)])
+fastStand.feed([0.12, 0.04, 0.01, ...Array(10).fill(0)])
+assert.equal(fastStand.events.jumps, 0)
+assert.equal(fastStand.events.crouchStarts, 1)
+assert.equal(fastStand.events.crouchEnds, 1)
+assert.ok(fastStand.events.phases.includes('crouchJumpPreparation'))
+assert.equal(fastStand.state.phase, 'neutral')
+
+// V5 regression 5: the same physical crouch-to-jump transition succeeds at
+// each realistic callback rate without duplicate actions.
+for (const fps of [24, 30, 60]) {
+  const crouchJumpAtRate = createVerticalDriver(1000 / fps)
+  crouchJumpAtRate.feed(sampleKeyframes([
+    [0, 0], [120, 0.4], [420, 0.4], [500, 0.4],
+    [555, 0.09], [610, -0.08], [690, -0.2],
+  ], fps))
+  assert.equal(crouchJumpAtRate.events.crouchStarts, 1, `crouch start at ${fps} FPS`)
+  assert.equal(crouchJumpAtRate.events.crouchEnds, 1, `crouch end at ${fps} FPS`)
+  assert.equal(crouchJumpAtRate.events.jumps, 1, `crouch jump at ${fps} FPS`)
+  assert.equal(crouchJumpAtRate.state.phase, 'jumpCooldown')
+  const jumpSample = crouchJumpAtRate.events.samples.find((sample) => sample.jumpTriggered)
+  assert.equal(jumpSample?.crouching, false, `released crouch before jump at ${fps} FPS`)
+}
+
+// V5 regression 6: continued takeoff/noise cannot duplicate the crouch jump;
+// a neutral recovery still rearms a later physical jump.
+atomicCrouchJump.feed([-0.16, -0.22, -0.18, -0.24, -0.12, -0.2])
+assert.equal(atomicCrouchJump.events.jumps, 1)
+atomicCrouchJump.feed(Array(12).fill(0))
+atomicCrouchJump.feed([-0.05, -0.16, -0.24])
+assert.equal(atomicCrouchJump.events.jumps, 2)
 
 // Millisecond timing and velocity normalization make intent classification
 // consistent across realistic camera callback rates.

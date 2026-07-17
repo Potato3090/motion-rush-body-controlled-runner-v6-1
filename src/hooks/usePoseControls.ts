@@ -271,7 +271,9 @@ export function usePoseControls({
     crouchingRef.current = verticalIntent.crouching
     const crouchChanged = crouchingRef.current !== wasCrouching
 
-    // Like lane position, crouch is a continuously refreshed held state.
+    // Like lane position, crouch is a continuously refreshed held state. This
+    // dispatch intentionally stays before onJump: a crouch-to-jump result must
+    // clear RunnerEngine.cameraCrouching synchronously before its jump guard runs.
     onCrouchChangeRef.current(crouchingRef.current)
 
     if (verticalIntent.jumpTriggered) onJumpRef.current()

@@ -1,6 +1,6 @@
-# Motion Rush V4
+# Motion Rush V5
 
-A mobile-first endless runner controlled by body movement through the phone's front camera. V4 adds torso-normalized jump-versus-crouch intent recognition and a faster, weighted, procedurally animated jump arc. It preserves V3's persisted Horizontal Sensitivity slider, absolute three-zone lane mapping, continuous camera-held crouching, PWA support, and non-camera controls.
+A mobile-first endless runner controlled by body movement through the phone's front camera. V5 adds a reliable held-crouch-to-jump transition for rapid obstacle combinations while preserving V4's approved weighted jump physics, torso-normalized intent recognition, persisted Horizontal Sensitivity slider, absolute lane mapping, PWA support, and non-camera controls.
 
 ## Run it on Replit
 

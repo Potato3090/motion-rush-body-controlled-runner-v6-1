@@ -3,6 +3,7 @@ export type VerticalIntentPhase =
   | 'possibleCrouch'
   | 'jumpPreparation'
   | 'crouched'
+  | 'crouchJumpPreparation'
   | 'rearming'
   | 'jumpCooldown'
 
@@ -27,6 +28,12 @@ export const VERTICAL_INTENT_TUNING = {
   reversalJumpDisplacement: -0.04,
   jumpActionLockoutMs: 260,
   crouchRearmConfirmationMs: 80,
+  crouchToJumpMinimumRise: 0.22,
+  crouchToJumpUpwardVelocity: -1.05,
+  crouchToJumpTriggerDisplacement: -0.045,
+  crouchToJumpWindowMs: 240,
+  crouchToJumpCancelVelocity: -0.35,
+  crouchToJumpReturnDepth: 0.18,
   velocityDeadzone: 0.16,
 } as const
 
@@ -146,6 +153,7 @@ function triggerJump(
   sampled: VerticalIntentState,
   now: number,
   direction: VerticalDirection,
+  flags: { crouchEnded?: boolean } = {},
 ): VerticalIntentResult {
   return result({
     ...sampled,
@@ -156,7 +164,7 @@ function triggerJump(
     neutralSince: null,
     lastActionAt: now,
     reversalDetected: true,
-  }, direction, { jumpTriggered: true })
+  }, direction, { jumpTriggered: true, crouchEnded: flags.crouchEnded })
 }
 
 /**
@@ -186,6 +194,57 @@ export function updateVerticalIntent(
     return result({ ...state, neutralSince }, direction)
   }
 
+  if (state.phase === 'crouchJumpPreparation') {
+    const beganAt = state.movementStartedAt ?? safeNow
+    const riseFromCrouch = state.maxDownwardDepth - displacement
+    const neutralSince = nearNeutral ? (state.neutralSince ?? safeNow) : null
+    const continuedTakeoff =
+      direction === 'up' &&
+      state.velocity <= VERTICAL_INTENT_TUNING.crouchToJumpUpwardVelocity &&
+      riseFromCrouch >= VERTICAL_INTENT_TUNING.crouchToJumpMinimumRise &&
+      displacement <= VERTICAL_INTENT_TUNING.crouchToJumpTriggerDisplacement
+    if (continuedTakeoff) return triggerJump(state, safeNow, direction)
+
+    const returnedToCrouch =
+      displacement >= VERTICAL_INTENT_TUNING.crouchToJumpReturnDepth &&
+      direction !== 'up'
+    if (returnedToCrouch) {
+      return result({
+        ...state,
+        phase: 'crouched',
+        movementStartedAt: null,
+        deepSince: null,
+        maxDownwardDepth: Math.max(state.maxDownwardDepth, displacement),
+        neutralSince: null,
+        reversalDetected: false,
+      }, direction)
+    }
+
+    const transitionExpired =
+      safeNow - beganAt > VERTICAL_INTENT_TUNING.crouchToJumpWindowMs
+    const upwardMotionCancelled =
+      nearNeutral &&
+      state.velocity >= VERTICAL_INTENT_TUNING.crouchToJumpCancelVelocity
+    if (transitionExpired || upwardMotionCancelled) {
+      const neutralConfirmed =
+        neutralSince !== null &&
+        safeNow - neutralSince >= VERTICAL_INTENT_TUNING.crouchRearmConfirmationMs
+      if (neutralConfirmed) {
+        return result(neutralState({ ...state, neutralSince }, safeNow), direction)
+      }
+      return result({
+        ...state,
+        phase: 'rearming',
+        movementStartedAt: null,
+        deepSince: null,
+        maxDownwardDepth: 0,
+        neutralSince,
+        reversalDetected: false,
+      }, direction)
+    }
+    return result({ ...state, neutralSince }, direction)
+  }
+
   if (state.phase === 'rearming') {
     const neutralSince = nearNeutral ? (state.neutralSince ?? safeNow) : null
     if (
@@ -198,7 +257,28 @@ export function updateVerticalIntent(
   }
 
   if (state.phase === 'crouched') {
+    const maxDownwardDepth = Math.max(state.maxDownwardDepth, displacement)
     if (displacement <= VERTICAL_INTENT_TUNING.crouchExitThreshold) {
+      const riseFromCrouch = maxDownwardDepth - displacement
+      const explosiveExit =
+        direction === 'up' &&
+        state.velocity <= VERTICAL_INTENT_TUNING.crouchToJumpUpwardVelocity &&
+        riseFromCrouch >= VERTICAL_INTENT_TUNING.crouchToJumpMinimumRise
+      if (explosiveExit) {
+        const preparationState: VerticalIntentState = {
+          ...state,
+          phase: 'crouchJumpPreparation',
+          movementStartedAt: safeNow,
+          deepSince: null,
+          maxDownwardDepth,
+          neutralSince: null,
+          reversalDetected: true,
+        }
+        if (displacement <= VERTICAL_INTENT_TUNING.crouchToJumpTriggerDisplacement) {
+          return triggerJump(preparationState, safeNow, direction, { crouchEnded: true })
+        }
+        return result(preparationState, direction, { crouchEnded: true })
+      }
       return result({
         ...state,
         phase: 'rearming',
@@ -209,7 +289,7 @@ export function updateVerticalIntent(
         reversalDetected: direction === 'up',
       }, direction, { crouchEnded: true })
     }
-    return result(state, direction)
+    return result({ ...state, maxDownwardDepth }, direction)
   }
 
   const directJump =
