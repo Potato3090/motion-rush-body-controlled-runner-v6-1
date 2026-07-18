@@ -13,7 +13,11 @@ const upBack = upFront - ROUTE_RAMP_LENGTH
 const roofBack = -19
 const downBack = roofBack - ROUTE_RAMP_LENGTH
 
-assert.equal(ROUTE_RAMP_LENGTH, 6, 'forward ramp length stays significantly shorter than the former 10 units')
+assert.equal(ROUTE_RAMP_LENGTH, 4.25, 'forward ramp length is short enough to create a clear, playable steep incline')
+assert.ok(
+  Math.atan(ROUTE_ROOF_HEIGHT / ROUTE_RAMP_LENGTH) * (180 / Math.PI) > 30,
+  'the ramp incline is visibly steeper than thirty degrees',
+)
 assert.equal(getRouteSurfaceHeight(upFront, upFront, upBack, roofBack, downBack, ROUTE_ROOF_HEIGHT), 0)
 assert.equal(getRouteSurfaceHeight(upBack, upFront, upBack, roofBack, downBack, ROUTE_ROOF_HEIGHT), ROUTE_ROOF_HEIGHT)
 assert.equal(getRouteSurfaceHeight((upFront + upBack) / 2, upFront, upBack, roofBack, downBack, ROUTE_ROOF_HEIGHT), ROUTE_ROOF_HEIGHT / 2)

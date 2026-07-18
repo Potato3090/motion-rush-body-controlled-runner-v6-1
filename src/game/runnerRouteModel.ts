@@ -1,6 +1,6 @@
 export const ROOF_TRANSFER_HEIGHT_TOLERANCE = 0.7
 export const RAMP_SIDE_ENTRY_MAX_HEIGHT = 0.62
-export const ROUTE_RAMP_LENGTH = 6
+export const ROUTE_RAMP_LENGTH = 4.25
 export const ROUTE_ROOF_HEIGHT = 2.5
 
 export type SurfaceTransitionKind =

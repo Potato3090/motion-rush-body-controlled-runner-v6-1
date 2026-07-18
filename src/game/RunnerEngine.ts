@@ -13,6 +13,7 @@ import {
   type JumpPhase,
 } from './jumpMotion'
 import {
+  areRoofHeightsCompatible,
   getRouteSurfaceHeight,
   isSafelyAboveTrainRoof,
   resolveSurfaceTransition,
@@ -55,6 +56,16 @@ interface CoinBurst {
   age: number
 }
 
+interface ElevatedTransferSupport {
+  active: boolean
+  sourceLane: RunnerLane
+  destinationLane: RunnerLane
+  sourceSurface: number
+  destinationSurface: number
+  intermediateSurface: number
+  startedDistance: number
+}
+
 interface RunnerEngineOptions {
   onSnapshot: (snapshot: GameSnapshot) => void
   onCrash: (snapshot: GameSnapshot) => void
@@ -75,6 +86,13 @@ const ROUTE_UP_FRONT = 19
 const ROUTE_UP_BACK = ROUTE_UP_FRONT - RAMP_LENGTH
 const ROUTE_ROOF_BACK = -19
 const ROUTE_DOWN_BACK = ROUTE_ROOF_BACK - RAMP_LENGTH
+const CAMERA_GROUND_Y = 7.45
+const CAMERA_Z = 14.15
+const CAMERA_LOOK_Z = -16.5
+const OVERHEAD_WIRE_HEIGHT = 11.55
+const OVERHEAD_GANTRY_HEIGHT = 11.85
+const BRIDGE_DECK_HEIGHT = 13.65
+const ELEVATED_TRANSFER_MAX_DISTANCE = 12
 
 const palette = {
   ink: 0x132543,
@@ -82,7 +100,7 @@ const palette = {
   violet: 0xa886ff,
   cyan: 0x22d3c5,
   blue: 0x168fea,
-  sky: 0x7dd8ff,
+  sky: 0x63caff,
   yellow: 0xffcc35,
   coral: 0xff625c,
   orange: 0xff8a3d,
@@ -195,8 +213,8 @@ export class RunnerEngine {
   private readonly clock = new THREE.Clock()
   private readonly cityMaterial = new THREE.MeshStandardMaterial({
     vertexColors: true,
-    roughness: 0.7,
-    metalness: 0.08,
+    roughness: 0.62,
+    metalness: 0.1,
   })
   private readonly trainGeometryCache = new Map<string, THREE.BufferGeometry>()
   private readonly hazardGeometryCache = new Map<string, THREE.BufferGeometry>()
@@ -255,6 +273,15 @@ export class RunnerEngine {
     kind: 'same-lane',
     destinationSupported: true,
   }
+  private readonly elevatedTransfer: ElevatedTransferSupport = {
+    active: false,
+    sourceLane: 1,
+    destinationLane: 1,
+    sourceSurface: 0,
+    destinationSurface: 0,
+    intermediateSurface: 0,
+    startedDistance: 0,
+  }
   private surfaceHeight = 0
   private previousSurfaceHeight = 0
   private cameraLookHeight = 1.9
@@ -283,7 +310,7 @@ export class RunnerEngine {
     this.renderer.shadowMap.type = THREE.PCFShadowMap
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
-    this.renderer.toneMappingExposure = 1.14
+    this.renderer.toneMappingExposure = 1.18
     this.renderer.domElement.setAttribute('aria-label', 'Motion Rush game world')
     this.renderer.domElement.setAttribute('role', 'img')
     this.container.appendChild(this.renderer.domElement)
@@ -307,9 +334,11 @@ export class RunnerEngine {
       this.cameraLookX = 0
       this.supportLaneIndex = 1
       this.surfaceTransitionKind = 'same-lane'
+      this.elevatedTransfer.active = false
       this.camera.position.x = 0
-      this.camera.position.y = 7.8
-      this.camera.lookAt(0, this.cameraLookHeight, -18)
+      this.camera.position.y = CAMERA_GROUND_Y
+      this.camera.position.z = CAMERA_Z
+      this.camera.lookAt(0, this.cameraLookHeight, CAMERA_LOOK_Z)
     }
     if (status === 'playing') this.clock.getDelta()
   }
@@ -324,6 +353,7 @@ export class RunnerEngine {
     this.targetX = 0
     this.supportLaneIndex = 1
     this.surfaceTransitionKind = 'same-lane'
+    this.elevatedTransfer.active = false
     this.jumpMotion = createGroundedJumpMotion()
     this.landingElapsed = LANDING_TOTAL_DURATION
     this.fallbackSlideTimer = 0
@@ -336,8 +366,8 @@ export class RunnerEngine {
     this.previousSurfaceHeight = 0
     this.cameraLookHeight = 1.9
     this.cameraLookX = 0
-    this.camera.position.set(0, 7.8, 15.1)
-    this.camera.lookAt(0, this.cameraLookHeight, -18)
+    this.camera.position.set(0, CAMERA_GROUND_Y, CAMERA_Z)
+    this.camera.lookAt(0, this.cameraLookHeight, CAMERA_LOOK_Z)
     this.landingEffectAge = 1
     this.resetWorldObjects()
     this.emitSnapshot()
@@ -347,13 +377,11 @@ export class RunnerEngine {
     if (this.status !== 'playing') return
 
     if (action === 'left') {
-      this.laneIndex = Math.max(0, this.laneIndex - 1) as RunnerLane
-      this.targetX = LANES[this.laneIndex]
+      this.setLaneTarget(Math.max(0, this.laneIndex - 1) as RunnerLane)
       return
     }
     if (action === 'right') {
-      this.laneIndex = Math.min(2, this.laneIndex + 1) as RunnerLane
-      this.targetX = LANES[this.laneIndex]
+      this.setLaneTarget(Math.min(2, this.laneIndex + 1) as RunnerLane)
       return
     }
     if (action === 'jump' && !this.isCrouching()) {
@@ -370,6 +398,40 @@ export class RunnerEngine {
   /** Camera input sets an absolute destination and may replace it mid-transition. */
   setTargetLane(lane: RunnerLane) {
     if (this.status !== 'playing' && this.status !== 'countdown') return
+    this.setLaneTarget(lane)
+  }
+
+  private setLaneTarget(lane: RunnerLane) {
+    if (lane === this.laneIndex) return
+    const sourceLane = this.supportLaneIndex
+    const actualSourceSurface = this.getSupportSurfaceAtWorldZ(sourceLane, PLAYER_Z)
+    const sourceSurface = Math.max(
+      actualSourceSurface,
+      this.elevatedTransfer.active ? this.surfaceHeight : 0,
+    )
+    const destinationSurface = this.getSupportSurfaceAtWorldZ(lane, PLAYER_Z)
+    const intermediateSurface = Math.abs(sourceLane - lane) === 2
+      ? this.getSupportSurfaceAtWorldZ(1, PLAYER_Z)
+      : 0
+    const adjacentRoof = Math.abs(sourceLane - lane) === 1 &&
+      areRoofHeightsCompatible(sourceSurface, destinationSurface)
+    const supportedTwoLanePath = Math.abs(sourceLane - lane) === 2 &&
+      areRoofHeightsCompatible(sourceSurface, intermediateSurface) &&
+      areRoofHeightsCompatible(intermediateSurface, destinationSurface)
+
+    this.elevatedTransfer.active = adjacentRoof || supportedTwoLanePath
+    if (this.elevatedTransfer.active) {
+      this.elevatedTransfer.sourceLane = sourceLane
+      this.elevatedTransfer.destinationLane = lane
+      this.elevatedTransfer.sourceSurface = sourceSurface
+      this.elevatedTransfer.destinationSurface = destinationSurface
+      this.elevatedTransfer.intermediateSurface = intermediateSurface
+      this.elevatedTransfer.startedDistance = this.distance
+      if (this.profiling) {
+        this.renderer.domElement.dataset.lastElevatedTransfer =
+          `${sourceLane}->${lane}@${this.distance.toFixed(2)}`
+      }
+    }
     this.laneIndex = lane
     this.targetX = LANES[lane]
   }
@@ -406,7 +468,7 @@ export class RunnerEngine {
 
   private createScene() {
     this.scene.background = new THREE.Color(palette.sky)
-    this.scene.fog = new THREE.Fog(0xbceaff, 82, 285)
+    this.scene.fog = new THREE.Fog(0xb4e8ff, 92, 300)
 
     const hemisphere = new THREE.HemisphereLight(0xeafaff, 0x6c7764, 2.75)
     this.scene.add(hemisphere)
@@ -433,8 +495,8 @@ export class RunnerEngine {
 
     this.createSkyline()
 
-    this.camera.position.set(0, 7.8, 15.1)
-    this.camera.lookAt(0, 1.9, -18)
+    this.camera.position.set(0, CAMERA_GROUND_Y, CAMERA_Z)
+    this.camera.lookAt(0, 1.9, CAMERA_LOOK_Z)
 
     this.createTrackSystem()
     for (let i = 0; i < 24; i += 1) this.createScenery(i)
@@ -561,6 +623,16 @@ export class RunnerEngine {
         color: theme.trim,
         position: [0, roofRoute ? TRAIN_ROOF_HEIGHT - 0.1 : bodyHeight + 0.15, 0],
       },
+      {
+        geometry: new THREE.BoxGeometry(2.34, 0.1, length - 0.5),
+        color: 0x287599,
+        position: [0, roofRoute ? TRAIN_ROOF_HEIGHT + 0.025 : bodyHeight + 0.275, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(2.84, 0.22, length - 0.25),
+        color: 0x26384c,
+        position: [0, 0.2, 0],
+      },
     ]
 
     const windowY = roofRoute ? 1.58 : 1.9
@@ -604,6 +676,14 @@ export class RunnerEngine {
       })
     }
 
+    for (const z of [-length * 0.27, length * 0.27]) {
+      parts.push({
+        geometry: new THREE.BoxGeometry(1.42, 0.075, 0.72),
+        color: theme.trim,
+        position: [0, roofRoute ? TRAIN_ROOF_HEIGHT + 0.1 : bodyHeight + 0.35, z],
+      })
+    }
+
     parts.push(
       {
         geometry: new THREE.BoxGeometry(2.5, roofRoute ? 1.75 : 2.2, 0.16),
@@ -619,6 +699,16 @@ export class RunnerEngine {
         geometry: new THREE.BoxGeometry(2.76, 0.3, 0.24),
         color: theme.trim,
         position: [0, 0.48, length / 2 + 0.2],
+      },
+      {
+        geometry: new THREE.BoxGeometry(2.18, 0.18, 0.16),
+        color: palette.ink,
+        position: [0, 0.2, length / 2 + 0.25],
+      },
+      {
+        geometry: new THREE.BoxGeometry(1.1, 0.16, 0.12),
+        color: theme.trim,
+        position: [0, roofRoute ? 2.08 : 2.62, length / 2 + 0.24],
       },
     )
     for (const x of [-0.82, 0.82]) {
@@ -641,7 +731,11 @@ export class RunnerEngine {
     slope.rotation.x = angle
     const slopeParts: ColoredGeometryPart[] = [{
       geometry: new THREE.BoxGeometry(2.78, deckThickness, slopeLength),
-      color: palette.blue,
+      color: 0x167eea,
+    }, {
+      geometry: new THREE.BoxGeometry(1.42, 0.025, slopeLength - 0.12),
+      color: 0x24d7df,
+      position: [0, 0.112, 0],
     }]
     for (const side of [-1, 1]) {
       slopeParts.push({
@@ -660,7 +754,7 @@ export class RunnerEngine {
     arrowShape.lineTo(-0.27, 0.08)
     arrowShape.lineTo(-0.62, 0.08)
     arrowShape.closePath()
-    for (const z of [-RAMP_LENGTH * 0.31, 0, RAMP_LENGTH * 0.31]) {
+    for (const z of [-RAMP_LENGTH * 0.25, RAMP_LENGTH * 0.25]) {
       slopeParts.push({
         geometry: new THREE.ShapeGeometry(arrowShape),
         color: palette.cream,
@@ -715,25 +809,25 @@ export class RunnerEngine {
         geometry: new THREE.CylinderGeometry(0.4, 0.4, 0.12, 14),
         color: palette.yellow,
         rotation: [Math.PI / 2, 0, 0],
-        scale: [0.84, 0.84, 0.84],
+        scale: [0.98, 0.98, 0.98],
       },
       {
         geometry: new THREE.TorusGeometry(0.4, 0.055, 6, 14),
         color: 0xffe779,
-        scale: [0.84, 0.84, 0.84],
+        scale: [0.98, 0.98, 0.98],
       },
       {
         geometry: new THREE.ShapeGeometry(createBoltShape(0.45)),
         color: 0xfff6bb,
         position: [0, 0, 0.075],
-        scale: [0.84, 0.84, 0.84],
+        scale: [0.98, 0.98, 0.98],
       },
       {
         geometry: new THREE.ShapeGeometry(createBoltShape(0.45)),
         color: 0xfff6bb,
         position: [0, 0, -0.075],
         rotation: [0, Math.PI, 0],
-        scale: [0.84, 0.84, 0.84],
+        scale: [0.98, 0.98, 0.98],
       },
     ])
     const instances = new THREE.InstancedMesh(geometry, this.cityMaterial, this.coins.length)
@@ -819,6 +913,15 @@ export class RunnerEngine {
           position: [LANES[lane], 0.025, z],
         })
       }
+      for (let z = -7.1; z <= 7.1; z += 3.64) {
+        for (const offset of [-0.72, 0.72]) {
+          trackParts.push({
+            geometry: new THREE.BoxGeometry(0.31, 0.12, 0.38),
+            color: palette.yellow,
+            position: [LANES[lane] + offset, 0.105, z],
+          })
+        }
+      }
     }
 
     for (const side of [-1, 1]) {
@@ -844,33 +947,40 @@ export class RunnerEngine {
           position: [side * 5.95, 0.05, 0],
         },
       )
+      for (let z = -7.4; z <= 7.4; z += 3.1) {
+        trackParts.push({
+          geometry: new THREE.BoxGeometry(0.44, 0.045, 1.28),
+          color: z % 2 > 0 ? palette.cream : palette.yellow,
+          position: [side * 6.01, 0.52, z],
+        })
+      }
     }
     for (const x of [LANES[0], LANES[2]]) {
       trackParts.push({
         geometry: new THREE.BoxGeometry(0.018, 0.018, TRACK_LENGTH),
         color: 0x8da8b3,
-        position: [x, 6.45, 0],
+        position: [x, OVERHEAD_WIRE_HEIGHT, 0],
       })
     }
 
     const overheadParts: ColoredGeometryPart[] = []
     for (const side of [-1, 1]) {
       overheadParts.push({
-        geometry: new THREE.CylinderGeometry(0.11, 0.15, 6.65, 8),
+        geometry: new THREE.CylinderGeometry(0.11, 0.18, 12.1, 8),
         color: 0x52758a,
-        position: [side * 5.72, 3.3, -7.4],
+        position: [side * 5.72, 6.02, -7.4],
       })
     }
     overheadParts.push({
       geometry: new THREE.BoxGeometry(11.65, 0.17, 0.2),
       color: 0x52758a,
-      position: [0, 6.42, -7.4],
+      position: [0, OVERHEAD_GANTRY_HEIGHT, -7.4],
     })
     for (const x of [LANES[0], LANES[2]]) {
       overheadParts.push({
-        geometry: new THREE.BoxGeometry(0.055, 0.7, 0.055),
+        geometry: new THREE.BoxGeometry(0.055, 0.62, 0.055),
         color: 0x52758a,
-        position: [x, 6.02, -7.4],
+        position: [x, OVERHEAD_GANTRY_HEIGHT - 0.4, -7.4],
       })
     }
 
@@ -914,7 +1024,7 @@ export class RunnerEngine {
     const side = index % 2 === 0 ? -1 : 1
     const height = 5.5 + ((index * 5) % 8)
     const width = 4 + ((index * 3) % 4)
-    const buildingColors = [0xff856a, 0x4dbfc0, 0xffd06d, 0x6e82df, 0xa56bd8, 0x60b97a]
+    const buildingColors = [0xff725f, 0x32bfc2, 0xffc84d, 0x5979e6, 0x9e5ce5, 0x45b96c]
     const buildingX = side * (10.5 + (index % 3) * 1.5)
     const parts: ColoredGeometryPart[] = [
       {
@@ -926,6 +1036,21 @@ export class RunnerEngine {
         geometry: new THREE.BoxGeometry(width + 0.35, 0.32, 6.15),
         color: index % 2 ? palette.coral : palette.yellow,
         position: [buildingX, height + 0.48, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(width + 0.16, 1.05, 6.02),
+        color: index % 2 ? 0x24558a : 0x5f3aa7,
+        position: [buildingX, 0.83, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(0.16, height - 0.8, 6.04),
+        color: index % 3 === 0 ? palette.cream : palette.yellow,
+        position: [buildingX - side * (width * 0.28), height / 2 + 0.7, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(Math.max(1.3, width * 0.42), 0.38, 2.1),
+        color: 0x2c5f82,
+        position: [buildingX, height + 0.82, 0.7],
       },
     ]
 
@@ -945,6 +1070,18 @@ export class RunnerEngine {
       position: [buildingX - side * (width / 2 + 0.7), 2.0, 0],
       rotation: [0, 0, side * 0.08],
     })
+    parts.push(
+      {
+        geometry: new THREE.BoxGeometry(0.08, 1.05, 2.35),
+        color: index % 2 ? palette.yellow : palette.cyan,
+        position: [buildingX - side * (width / 2 + 0.06), 0.95, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(0.1, 0.72, 1.62),
+        color: palette.cream,
+        position: [buildingX - side * (width / 2 + 0.08), 1.95, -2.05],
+      },
+    )
 
     const fenceColor = index % 2 ? 0x3d7185 : 0x4e6684
     for (const z of [-3.9, 0, 3.9]) {
@@ -984,6 +1121,19 @@ export class RunnerEngine {
 
     parts.push(
       {
+        geometry: new THREE.BoxGeometry(1.15, 0.48, 1.15),
+        color: index % 2 ? palette.cyan : palette.coral,
+        position: [side * 6.9, 0.72, 2.7],
+      },
+      {
+        geometry: new THREE.IcosahedronGeometry(0.72, 0),
+        color: index % 3 ? 0x55c764 : 0xff75a8,
+        position: [side * 6.9, 1.52, 2.7],
+      },
+    )
+
+    parts.push(
+      {
         geometry: new THREE.CylinderGeometry(0.07, 0.1, 4.2, 7),
         color: 0x31576e,
         position: [side * 7.15, 2.55, -3.4],
@@ -1009,28 +1159,28 @@ export class RunnerEngine {
       const bridgeColor = index % 16 === 5 ? 0x3e76a3 : 0xe96855
       for (const bridgeSide of [-1, 1]) {
         parts.push({
-          geometry: new THREE.BoxGeometry(0.7, 11.1, 0.75),
+          geometry: new THREE.BoxGeometry(0.7, BRIDGE_DECK_HEIGHT, 0.75),
           color: bridgeColor,
-          position: [bridgeSide * 7.9, 5.6, 0],
+          position: [bridgeSide * 7.9, BRIDGE_DECK_HEIGHT / 2, 0],
         })
       }
       parts.push(
         {
           geometry: new THREE.BoxGeometry(16.4, 0.76, 1.1),
           color: bridgeColor,
-          position: [0, 10.72, 0],
+          position: [0, BRIDGE_DECK_HEIGHT, 0],
         },
         {
           geometry: new THREE.BoxGeometry(5.2, 0.52, 0.12),
           color: palette.cream,
-          position: [0, 10.72, 0.61],
+          position: [0, BRIDGE_DECK_HEIGHT, 0.61],
         },
       )
       for (const x of [-1.5, 0, 1.5]) {
         parts.push({
           geometry: new THREE.ShapeGeometry(createBoltShape(0.24)),
           color: x === 0 ? palette.coral : palette.blue,
-          position: [x, 10.72, 0.685],
+          position: [x, BRIDGE_DECK_HEIGHT, 0.685],
         })
       }
     }
@@ -1234,7 +1384,7 @@ export class RunnerEngine {
   private getObstacleTrainRoofAtWorldZ(lane: number, worldZ: number) {
     for (const hazard of this.hazards) {
       if (hazard.kind !== 'block' || hazard.lane !== lane) continue
-      if (Math.abs(hazard.group.position.z - worldZ) <= OBSTACLE_TRAIN_LENGTH / 2 - 0.12) {
+      if (Math.abs(hazard.group.position.z - worldZ) <= OBSTACLE_TRAIN_LENGTH / 2 + 0.04) {
         return OBSTACLE_TRAIN_ROOF_HEIGHT
       }
     }
@@ -1283,7 +1433,7 @@ export class RunnerEngine {
 
   private resetWorldObjects() {
     this.placeRoofRoute(this.roofRoutes[0], 1, this.roofTestMode ? -34 : -82)
-    this.placeRoofRoute(this.roofRoutes[1], 0, this.roofTestMode ? -34 : -232)
+    this.placeRoofRoute(this.roofRoutes[1], this.roofTestMode ? 2 : 0, this.roofTestMode ? -34 : -232)
 
     let hazardZ = this.roofTestMode ? -190 : -36
     this.hazards.forEach((hazard, index) => {
@@ -1292,8 +1442,12 @@ export class RunnerEngine {
       const lane = this.findOpenLane((index * 2 + 1) % 3, hazardZ)
       this.updateHazard(hazard, kind, lane, hazardZ, (index + lane) % trainThemes.length)
     })
+    if (this.roofTestMode) {
+      const shortTransferTrain = this.hazards.find((hazard) => hazard.kind === 'block')
+      if (shortTransferTrain) this.updateHazard(shortTransferTrain, 'block', 0, -34, 3)
+    }
 
-    const routeCoinZs = [17.2, 15.2, 12.4, 8, 4, 0, -4, -8, -12, -17, -21.5, -24.2]
+    const routeCoinZs = [18.1, 16.4, 14.4, 10, 5, 0, -5, -10, -15, -18.2, -20.8, -22.8]
     const routeCoinCount = routeCoinZs.length * this.roofRoutes.length
     let groundCoinZ = -20
     this.coins.forEach((coin, index) => {
@@ -1487,6 +1641,7 @@ export class RunnerEngine {
         crouching: this.isCrouching(),
         status: this.status,
         distance: this.distance,
+        elevatedTransfer: this.elevatedTransfer.active,
       })
       this.profileStateElapsed = 0
     }
@@ -1520,6 +1675,14 @@ export class RunnerEngine {
       status: this.status,
       distance: this.distance,
       rampLength: RAMP_LENGTH,
+      rampAngleDegrees: THREE.MathUtils.radToDeg(Math.atan(TRAIN_ROOF_HEIGHT / RAMP_LENGTH)),
+      cameraY: this.camera.position.y,
+      cameraZ: this.camera.position.z,
+      overheadHeight: OVERHEAD_GANTRY_HEIGHT,
+      elevatedTransfer: this.elevatedTransfer.active,
+      trainHazards: this.hazards
+        .filter((hazard) => hazard.kind === 'block')
+        .map((hazard) => ({ lane: hazard.lane, z: hazard.group.position.z })),
       routePositions: this.roofRoutes.map((route) => ({ lane: route.lane, z: route.group.position.z })),
     })
     this.profileElapsed = 0
@@ -1615,10 +1778,24 @@ export class RunnerEngine {
 
     this.previousSurfaceHeight = this.surfaceHeight
     const sourceLane = this.supportLaneIndex
-    const sourceSurface = this.getSupportSurfaceAtWorldZ(sourceLane, PLAYER_Z)
+    let sourceSurface = this.getSupportSurfaceAtWorldZ(sourceLane, PLAYER_Z)
     const destinationRouteSurface = this.getRouteSurfaceAtWorldZ(this.laneIndex, PLAYER_Z)
     const destinationTrainSurface = this.getObstacleTrainRoofAtWorldZ(this.laneIndex, PLAYER_Z)
-    const destinationSurface = Math.max(destinationRouteSurface, destinationTrainSurface)
+    let destinationSurface = Math.max(destinationRouteSurface, destinationTrainSurface)
+    let intermediateSurface = Math.abs(sourceLane - this.laneIndex) === 2
+      ? this.getSupportSurfaceAtWorldZ(1, PLAYER_Z)
+      : 0
+    const transferIsCurrent = this.elevatedTransfer.active &&
+      this.elevatedTransfer.sourceLane === sourceLane &&
+      this.elevatedTransfer.destinationLane === this.laneIndex &&
+      this.distance - this.elevatedTransfer.startedDistance <= ELEVATED_TRANSFER_MAX_DISTANCE
+    if (transferIsCurrent) {
+      sourceSurface = Math.max(sourceSurface, this.elevatedTransfer.sourceSurface)
+      destinationSurface = Math.max(destinationSurface, this.elevatedTransfer.destinationSurface)
+      intermediateSurface = Math.max(intermediateSurface, this.elevatedTransfer.intermediateSurface)
+    } else if (this.elevatedTransfer.active) {
+      this.elevatedTransfer.active = false
+    }
     const transitionDistance = Math.abs(LANES[this.laneIndex] - LANES[sourceLane])
     const transitionProgress = transitionDistance < 0.01
       ? 1
@@ -1629,7 +1806,7 @@ export class RunnerEngine {
     transitionInput.sourceSurface = sourceSurface
     transitionInput.destinationSurface = destinationSurface
     transitionInput.intermediateSurface = Math.abs(sourceLane - this.laneIndex) === 2
-      ? this.getSupportSurfaceAtWorldZ(1, PLAYER_Z)
+      ? intermediateSurface
       : undefined
     transitionInput.progress = transitionProgress
     const transition = resolveSurfaceTransition(transitionInput, this.surfaceTransitionResult)
@@ -1655,6 +1832,7 @@ export class RunnerEngine {
       transition.destinationSupported
     ) {
       this.supportLaneIndex = this.laneIndex
+      if (transferIsCurrent) this.elevatedTransfer.active = false
     }
     if (this.previousSurfaceHeight < TRAIN_ROOF_HEIGHT - 0.08 && this.surfaceHeight >= TRAIN_ROOF_HEIGHT - 0.02) {
       this.triggerLandingEffect()
@@ -1715,14 +1893,15 @@ export class RunnerEngine {
     else this.animateLimbs(this.elapsed * (9.5 + this.speed * 0.08), sliding ? 0.18 : 0.72)
     this.updatePlayerShadow(this.jumpMotion.height, landingCompression)
 
-    const targetCameraY = 7.8 + this.surfaceHeight * 0.68
+    const targetCameraY = CAMERA_GROUND_Y + this.surfaceHeight * 0.68
     const targetCameraX = this.player.position.x * 0.72
     this.camera.position.x = THREE.MathUtils.lerp(this.camera.position.x, targetCameraX, 1 - Math.exp(-delta * 7))
     this.camera.position.y = THREE.MathUtils.lerp(this.camera.position.y, targetCameraY, 1 - Math.exp(-delta * 5.5))
     const targetLookHeight = 1.9 + this.surfaceHeight * 0.56
     this.cameraLookHeight = THREE.MathUtils.lerp(this.cameraLookHeight, targetLookHeight, 1 - Math.exp(-delta * 6))
     this.cameraLookX = THREE.MathUtils.lerp(this.cameraLookX, this.player.position.x * 0.44, 1 - Math.exp(-delta * 7))
-    this.camera.lookAt(this.cameraLookX, this.cameraLookHeight, -18)
+    this.camera.position.z = THREE.MathUtils.lerp(this.camera.position.z, CAMERA_Z, 1 - Math.exp(-delta * 4))
+    this.camera.lookAt(this.cameraLookX, this.cameraLookHeight, CAMERA_LOOK_Z)
   }
 
   private animateLimbs(phase: number, amount: number) {
@@ -1898,6 +2077,7 @@ export class RunnerEngine {
   }
 
   private crash() {
+    this.elevatedTransfer.active = false
     this.status = 'gameover'
     this.player.rotation.z = this.player.position.x < 0 ? 0.38 : -0.38
     this.options.onCrash(this.getSnapshot())
