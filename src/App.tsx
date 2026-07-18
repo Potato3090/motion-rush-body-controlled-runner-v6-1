@@ -317,6 +317,14 @@ function App() {
                   <b>{['LEFT', 'CENTER', 'RIGHT'][pose.signal.lane]} · {Math.round(pose.signal.confidence * 100)}%</b>
                 )}
               </div>
+              {cameraIsActive && (
+                <div className="pose-action-strip" aria-label="Detected body controls">
+                  <span className={pose.signal.lane === 0 ? 'active' : ''}><ArrowLeft size={11} /> LEFT</span>
+                  <span className={pose.signal.lane === 2 ? 'active' : ''}><ArrowRight size={11} /> RIGHT</span>
+                  <span className={pose.signal.jumpTriggered ? 'active' : ''}><ArrowUp size={11} /> JUMP</span>
+                  <span className={pose.signal.crouching ? 'active' : ''}><ArrowDown size={11} /> CROUCH</span>
+                </div>
+              )}
               <label className="sensitivity-control" htmlFor="horizontal-sensitivity">
                 <span className="sensitivity-head">
                   <span>Horizontal Sensitivity</span>
