@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test:controls": "tsc src/game/poseControlModel.ts src/game/settings.ts src/game/verticalIntentModel.ts src/game/jumpMotion.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/poseControlModel.mjs && node tests/runnerMotion.mjs",
+    "test:controls": "tsc src/game/poseControlModel.ts src/game/settings.ts src/game/verticalIntentModel.ts src/game/jumpMotion.ts src/game/runnerRouteModel.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/poseControlModel.mjs && node tests/runnerMotion.mjs && node tests/runnerRoutes.mjs",
     "start": "vite preview --host 0.0.0.0 --port 3000",
     "preview": "vite preview"
   },

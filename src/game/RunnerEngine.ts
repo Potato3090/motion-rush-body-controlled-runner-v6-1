@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
 import type { GameSnapshot, GameStatus, RunnerAction, RunnerLane } from './types'
 import {
   JUMP_CLEARANCE_HEIGHT,
@@ -11,11 +12,22 @@ import {
   tryStartJump,
   type JumpPhase,
 } from './jumpMotion'
+import {
+  getRouteSurfaceHeight,
+  isSafelyAboveTrainRoof,
+  resolveSurfaceTransition,
+  ROUTE_RAMP_LENGTH,
+  ROUTE_ROOF_HEIGHT,
+  type SurfaceTransitionInput,
+  type SurfaceTransitionKind,
+  type SurfaceTransitionResult,
+} from './runnerRouteModel'
 
 type HazardKind = 'block' | 'jump' | 'slide'
 
 interface Hazard {
   group: THREE.Group
+  visual: THREE.Mesh
   kind: HazardKind
   lane: number
   hit: boolean
@@ -55,8 +67,10 @@ const TRACK_SEGMENTS = 18
 const PLAYER_Z = 5.5
 const START_SPEED = 19
 const MAX_SPEED = 35
-const TRAIN_ROOF_HEIGHT = 2.5
-const RAMP_LENGTH = 10
+const TRAIN_ROOF_HEIGHT = ROUTE_ROOF_HEIGHT
+const OBSTACLE_TRAIN_ROOF_HEIGHT = 3
+const OBSTACLE_TRAIN_LENGTH = 6.1
+const RAMP_LENGTH = ROUTE_RAMP_LENGTH
 const ROUTE_UP_FRONT = 19
 const ROUTE_UP_BACK = ROUTE_UP_FRONT - RAMP_LENGTH
 const ROUTE_ROOF_BACK = -19
@@ -87,6 +101,52 @@ const trainThemes = [
   { primary: 0xe84c4f, secondary: 0xfff0cf, trim: 0x2454a6 },
 ] as const
 
+interface ColoredGeometryPart {
+  geometry: THREE.BufferGeometry
+  color: number
+  position?: [number, number, number]
+  rotation?: [number, number, number]
+  scale?: [number, number, number]
+}
+
+const identityPosition: [number, number, number] = [0, 0, 0]
+const identityRotation: [number, number, number] = [0, 0, 0]
+const identityScale: [number, number, number] = [1, 1, 1]
+
+function mergeColoredParts(parts: ColoredGeometryPart[]) {
+  const transformed = parts.map((part) => {
+    let geometry = part.geometry
+    if (geometry.index) {
+      const indexedGeometry = geometry
+      geometry = indexedGeometry.toNonIndexed()
+      indexedGeometry.dispose()
+    }
+    const position = new THREE.Vector3(...(part.position ?? identityPosition))
+    const rotation = new THREE.Euler(...(part.rotation ?? identityRotation))
+    const scale = new THREE.Vector3(...(part.scale ?? identityScale))
+    geometry.applyMatrix4(new THREE.Matrix4().compose(
+      position,
+      new THREE.Quaternion().setFromEuler(rotation),
+      scale,
+    ))
+    const color = new THREE.Color(part.color)
+    const colors = new Float32Array(geometry.attributes.position.count * 3)
+    for (let index = 0; index < colors.length; index += 3) {
+      colors[index] = color.r
+      colors[index + 1] = color.g
+      colors[index + 2] = color.b
+    }
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    return geometry
+  })
+  const merged = mergeGeometries(transformed, false)
+  transformed.forEach((geometry) => geometry.dispose())
+  if (!merged) throw new Error('Unable to merge Motion Rush geometry')
+  merged.computeBoundingBox()
+  merged.computeBoundingSphere()
+  return merged
+}
+
 function material(color: number, roughness = 0.72, metalness = 0.04) {
   return new THREE.MeshStandardMaterial({ color, roughness, metalness })
 }
@@ -98,8 +158,8 @@ function mesh(
   metalness?: number,
 ) {
   const item = new THREE.Mesh(geometry, material(color, roughness, metalness))
-  item.castShadow = true
-  item.receiveShadow = true
+  item.castShadow = false
+  item.receiveShadow = false
   return item
 }
 
@@ -133,7 +193,18 @@ export class RunnerEngine {
   private readonly scene = new THREE.Scene()
   private readonly camera = new THREE.PerspectiveCamera(58, 1, 0.1, 500)
   private readonly clock = new THREE.Clock()
-  private readonly tracks: THREE.Group[] = []
+  private readonly cityMaterial = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.7,
+    metalness: 0.08,
+  })
+  private readonly trainGeometryCache = new Map<string, THREE.BufferGeometry>()
+  private readonly hazardGeometryCache = new Map<string, THREE.BufferGeometry>()
+  private readonly trackZs = new Float32Array(TRACK_SEGMENTS)
+  private trackInstances?: THREE.InstancedMesh
+  private overheadInstances?: THREE.InstancedMesh
+  private coinInstances?: THREE.InstancedMesh
+  private readonly instanceTransform = new THREE.Object3D()
   private readonly scenery: THREE.Group[] = []
   private readonly hazards: Hazard[] = []
   private readonly coins: Coin[] = []
@@ -170,20 +241,46 @@ export class RunnerEngine {
   private destroyed = false
   private lastHazardLane = 1
   private lastHazardKind: HazardKind = 'jump'
+  private supportLaneIndex: RunnerLane = 1
+  private surfaceTransitionKind: SurfaceTransitionKind = 'same-lane'
+  private readonly surfaceTransitionInput: SurfaceTransitionInput = {
+    sourceLane: 1,
+    destinationLane: 1,
+    sourceSurface: 0,
+    destinationSurface: 0,
+    progress: 1,
+  }
+  private readonly surfaceTransitionResult: SurfaceTransitionResult = {
+    height: 0,
+    kind: 'same-lane',
+    destinationSupported: true,
+  }
   private surfaceHeight = 0
   private previousSurfaceHeight = 0
   private cameraLookHeight = 1.9
   private cameraLookX = 0
   private burstCursor = 0
   private landingEffectAge = 1
+  private readonly profiling = new URLSearchParams(window.location.search).has('profile')
+  private readonly roofTestMode = import.meta.env.DEV && new URLSearchParams(window.location.search).has('roofTest')
+  private profileElapsed = 0
+  private profileStateElapsed = 0
+  private profileFrames = 0
+  private readonly profileFrameTimes: number[] = []
 
   constructor(container: HTMLElement, options: RunnerEngineOptions) {
     this.container = container
     this.options = options
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' })
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.6))
+    const mobileViewport = window.matchMedia('(pointer: coarse)').matches || Math.min(window.innerWidth, window.innerHeight) <= 768
+    const highDensityMobile = mobileViewport && window.devicePixelRatio > 1.4
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: !highDensityMobile,
+      alpha: false,
+      powerPreference: 'high-performance',
+    })
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, mobileViewport ? 1.25 : 1.5))
     this.renderer.shadowMap.enabled = true
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    this.renderer.shadowMap.type = THREE.PCFShadowMap
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
     this.renderer.toneMappingExposure = 1.14
@@ -208,6 +305,8 @@ export class RunnerEngine {
       this.previousSurfaceHeight = 0
       this.cameraLookHeight = 1.9
       this.cameraLookX = 0
+      this.supportLaneIndex = 1
+      this.surfaceTransitionKind = 'same-lane'
       this.camera.position.x = 0
       this.camera.position.y = 7.8
       this.camera.lookAt(0, this.cameraLookHeight, -18)
@@ -223,6 +322,8 @@ export class RunnerEngine {
     this.elapsed = 0
     this.laneIndex = 1
     this.targetX = 0
+    this.supportLaneIndex = 1
+    this.surfaceTransitionKind = 'same-lane'
     this.jumpMotion = createGroundedJumpMotion()
     this.landingElapsed = LANDING_TOTAL_DURATION
     this.fallbackSlideTimer = 0
@@ -313,13 +414,13 @@ export class RunnerEngine {
     const sun = new THREE.DirectionalLight(0xfff0c5, 3.35)
     sun.position.set(-16, 24, 18)
     sun.castShadow = true
-    sun.shadow.mapSize.set(1024, 1024)
-    sun.shadow.camera.left = -12
-    sun.shadow.camera.right = 12
-    sun.shadow.camera.top = 20
-    sun.shadow.camera.bottom = -7
+    sun.shadow.mapSize.set(512, 512)
+    sun.shadow.camera.left = -10
+    sun.shadow.camera.right = 10
+    sun.shadow.camera.top = 16
+    sun.shadow.camera.bottom = -5
     sun.shadow.camera.near = 2
-    sun.shadow.camera.far = 70
+    sun.shadow.camera.far = 48
     sun.shadow.bias = -0.00018
     this.scene.add(sun)
 
@@ -335,7 +436,7 @@ export class RunnerEngine {
     this.camera.position.set(0, 7.8, 15.1)
     this.camera.lookAt(0, 1.9, -18)
 
-    for (let i = 0; i < TRACK_SEGMENTS; i += 1) this.createTrackSegment(i)
+    this.createTrackSystem()
     for (let i = 0; i < 24; i += 1) this.createScenery(i)
 
     const firstRoute = this.createRoofRoute(1, 0)
@@ -354,8 +455,8 @@ export class RunnerEngine {
     for (let i = 0; i < 46; i += 1) {
       const coin = this.createCoin()
       this.coins.push(coin)
-      this.scene.add(coin.mesh)
     }
+    this.createCoinInstances()
 
     this.createEffects()
 
@@ -364,128 +465,190 @@ export class RunnerEngine {
 
   private createSkyline() {
     const cloudMaterial = flatMaterial(0xffffff, 0.78)
+    const clouds = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 6), cloudMaterial, 28)
+    const cloudTransform = new THREE.Object3D()
+    let cloudIndex = 0
     for (let i = 0; i < 7; i += 1) {
-      const cloud = new THREE.Group()
       for (let puff = 0; puff < 4; puff += 1) {
-        const sphere = new THREE.Mesh(
-          new THREE.SphereGeometry(1.2 + (puff % 2) * 0.45, 12, 8),
-          cloudMaterial,
+        const radius = 1.2 + (puff % 2) * 0.45
+        const side = i % 2 ? 1 : -1
+        const cloudRotation = i % 2 ? -0.16 : 0.14
+        const localX = (puff - 1.5) * 1.25
+        const localZ = -Math.sin(cloudRotation) * localX
+        cloudTransform.position.set(
+          side * (10 + i * 2.8) + Math.cos(cloudRotation) * localX,
+          13 + (i % 3) * 2.1 + (puff % 2) * 0.42,
+          -65 - i * 22 + localZ,
         )
-        sphere.scale.y = 0.56
-        sphere.position.set((puff - 1.5) * 1.25, (puff % 2) * 0.42, 0)
-        cloud.add(sphere)
+        cloudTransform.scale.set(radius, radius * 0.56, radius)
+        cloudTransform.updateMatrix()
+        clouds.setMatrixAt(cloudIndex, cloudTransform.matrix)
+        cloudIndex += 1
       }
-      cloud.position.set((i % 2 ? 1 : -1) * (10 + i * 2.8), 13 + (i % 3) * 2.1, -65 - i * 22)
-      cloud.rotation.y = i % 2 ? -0.16 : 0.14
-      this.scene.add(cloud)
     }
+    clouds.frustumCulled = false
+    this.scene.add(clouds)
 
-    const skyline = new THREE.Group()
+    const skylineParts: ColoredGeometryPart[] = []
     const skylineColors = [0x6f94bd, 0x7aa5bd, 0x7395ad, 0x84a6c6]
     for (let i = 0; i < 22; i += 1) {
       const side = i % 2 ? 1 : -1
       const height = 9 + ((i * 7) % 16)
-      const building = mesh(
-        new THREE.BoxGeometry(4 + (i % 4), height, 5),
-        skylineColors[i % skylineColors.length],
-        0.95,
-      )
-      building.castShadow = false
-      building.position.set(side * (14 + (i % 7) * 5), height / 2 - 0.5, -135 - (i % 5) * 18)
-      skyline.add(building)
+      skylineParts.push({
+        geometry: new THREE.BoxGeometry(4 + (i % 4), height, 5),
+        color: skylineColors[i % skylineColors.length],
+        position: [side * (14 + (i % 7) * 5), height / 2 - 0.5, -135 - (i % 5) * 18],
+      })
     }
 
-    const tunnelArch = new THREE.Mesh(
-      new THREE.TorusGeometry(6.4, 0.38, 8, 32, Math.PI),
-      material(0x376f91, 0.7, 0.18),
+    skylineParts.push(
+      {
+        geometry: new THREE.TorusGeometry(6.4, 0.38, 8, 24, Math.PI),
+        color: 0x376f91,
+        position: [0, 0.6, -205],
+      },
+      {
+        geometry: new THREE.BoxGeometry(0.78, 6.7, 1.0),
+        color: 0x376f91,
+        position: [-6.4, 3.4, -205],
+      },
+      {
+        geometry: new THREE.BoxGeometry(0.78, 6.7, 1.0),
+        color: 0x376f91,
+        position: [6.4, 3.4, -205],
+      },
     )
-    tunnelArch.position.set(0, 0.6, -205)
-    const tunnelLeft = mesh(new THREE.BoxGeometry(0.78, 6.7, 1.0), 0x376f91, 0.72, 0.16)
-    tunnelLeft.position.set(-6.4, 3.4, -205)
-    const tunnelRight = tunnelLeft.clone()
-    tunnelRight.position.x = 6.4
-    skyline.add(tunnelArch, tunnelLeft, tunnelRight)
+    const skyline = new THREE.Mesh(mergeColoredParts(skylineParts), this.cityMaterial)
+    skyline.castShadow = false
+    skyline.receiveShadow = false
     this.scene.add(skyline)
   }
 
   private createTrainVisual(themeIndex: number, length: number, roofRoute: boolean) {
+    const geometry = this.getTrainGeometry(themeIndex, length, roofRoute)
+    const train = new THREE.Mesh(geometry, this.cityMaterial)
+    train.castShadow = true
+    train.receiveShadow = true
+    return train
+  }
+
+  private getTrainGeometry(themeIndex: number, length: number, roofRoute: boolean) {
+    const cacheKey = `${themeIndex % trainThemes.length}:${length.toFixed(2)}:${roofRoute ? 'roof' : 'obstacle'}`
+    let geometry = this.trainGeometryCache.get(cacheKey)
+    if (!geometry) {
+      geometry = this.createTrainGeometry(themeIndex, length, roofRoute)
+      this.trainGeometryCache.set(cacheKey, geometry)
+    }
+    return geometry
+  }
+
+  private createTrainGeometry(themeIndex: number, length: number, roofRoute: boolean) {
     const theme = trainThemes[themeIndex % trainThemes.length]
-    const train = new THREE.Group()
     const bodyHeight = roofRoute ? 2.25 : 2.75
-    const body = mesh(new THREE.BoxGeometry(2.72, bodyHeight, length), theme.primary, 0.56, 0.08)
-    body.position.y = bodyHeight / 2 + 0.12
-    train.add(body)
-
-    const lowerBand = mesh(new THREE.BoxGeometry(2.78, 0.42, length + 0.05), theme.secondary, 0.55, 0.08)
-    lowerBand.position.y = 0.49
-    train.add(lowerBand)
-
-    const roof = mesh(new THREE.BoxGeometry(2.8, 0.2, length - 0.18), theme.trim, 0.48, 0.14)
-    roof.position.y = roofRoute ? TRAIN_ROOF_HEIGHT - 0.1 : bodyHeight + 0.15
-    train.add(roof)
+    const parts: ColoredGeometryPart[] = [
+      {
+        geometry: new THREE.BoxGeometry(2.72, bodyHeight, length),
+        color: theme.primary,
+        position: [0, bodyHeight / 2 + 0.12, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(2.78, 0.42, length + 0.05),
+        color: theme.secondary,
+        position: [0, 0.49, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(2.8, 0.2, length - 0.18),
+        color: theme.trim,
+        position: [0, roofRoute ? TRAIN_ROOF_HEIGHT - 0.1 : bodyHeight + 0.15, 0],
+      },
+    ]
 
     const windowY = roofRoute ? 1.58 : 1.9
-    const windowCount = Math.max(2, Math.min(9, Math.floor(length / 3.3)))
+    const windowCount = Math.max(2, Math.min(7, Math.floor(length / 3.8)))
     const windowSpacing = (length - 2.1) / windowCount
     for (let i = 0; i < windowCount; i += 1) {
       const z = -length / 2 + 1.1 + windowSpacing * (i + 0.5)
       for (const side of [-1, 1]) {
-        const window = mesh(new THREE.BoxGeometry(0.055, 0.72, Math.min(1.65, windowSpacing * 0.66)), 0x174b70, 0.2, 0.3)
-        window.position.set(side * 1.385, windowY, z)
-        train.add(window)
+        parts.push({
+          geometry: new THREE.BoxGeometry(0.055, 0.72, Math.min(1.65, windowSpacing * 0.66)),
+          color: 0x174b70,
+          position: [side * 1.385, windowY, z],
+        })
       }
     }
 
     const doorZs = length > 12 ? [-length * 0.28, length * 0.28] : [0]
     for (const z of doorZs) {
       for (const side of [-1, 1]) {
-        const door = mesh(new THREE.BoxGeometry(0.06, 1.38, 1.04), theme.secondary, 0.58)
-        door.position.set(side * 1.405, 1.23, z)
-        train.add(door)
-        const doorWindow = mesh(new THREE.BoxGeometry(0.065, 0.48, 0.58), 0xbeeaff, 0.18, 0.2)
-        doorWindow.position.set(side * 1.442, 1.58, z)
-        train.add(doorWindow)
+        parts.push(
+          {
+            geometry: new THREE.BoxGeometry(0.06, 1.38, 1.04),
+            color: theme.secondary,
+            position: [side * 1.405, 1.23, z],
+          },
+          {
+            geometry: new THREE.BoxGeometry(0.065, 0.48, 0.58),
+            color: 0xbeeaff,
+            position: [side * 1.442, 1.58, z],
+          },
+        )
       }
     }
 
     for (const z of [-length * 0.31, length * 0.31]) {
-      const axle = mesh(new THREE.CylinderGeometry(0.31, 0.31, 2.42, 12), 0x26303c, 0.68, 0.36)
-      axle.rotation.z = Math.PI / 2
-      axle.position.set(0, 0.25, z)
-      train.add(axle)
+      parts.push({
+        geometry: new THREE.CylinderGeometry(0.31, 0.31, 2.42, 8),
+        color: 0x26303c,
+        position: [0, 0.25, z],
+        rotation: [0, 0, Math.PI / 2],
+      })
     }
 
-    const front = mesh(new THREE.BoxGeometry(2.5, roofRoute ? 1.75 : 2.2, 0.16), theme.secondary, 0.42, 0.08)
-    front.position.set(0, roofRoute ? 1.32 : 1.56, length / 2 + 0.09)
-    train.add(front)
-    const windshield = mesh(new THREE.BoxGeometry(1.78, roofRoute ? 0.62 : 0.82, 0.1), 0x153e63, 0.16, 0.28)
-    windshield.position.set(0, roofRoute ? 1.66 : 2.0, length / 2 + 0.19)
-    train.add(windshield)
-    const bumper = mesh(new THREE.BoxGeometry(2.76, 0.3, 0.24), theme.trim, 0.48, 0.18)
-    bumper.position.set(0, 0.48, length / 2 + 0.2)
-    train.add(bumper)
+    parts.push(
+      {
+        geometry: new THREE.BoxGeometry(2.5, roofRoute ? 1.75 : 2.2, 0.16),
+        color: theme.secondary,
+        position: [0, roofRoute ? 1.32 : 1.56, length / 2 + 0.09],
+      },
+      {
+        geometry: new THREE.BoxGeometry(1.78, roofRoute ? 0.62 : 0.82, 0.1),
+        color: 0x153e63,
+        position: [0, roofRoute ? 1.66 : 2.0, length / 2 + 0.19],
+      },
+      {
+        geometry: new THREE.BoxGeometry(2.76, 0.3, 0.24),
+        color: theme.trim,
+        position: [0, 0.48, length / 2 + 0.2],
+      },
+    )
     for (const x of [-0.82, 0.82]) {
-      const light = mesh(new THREE.SphereGeometry(0.16, 10, 8), 0xfff2a8, 0.2, 0.05)
-      light.position.set(x, 0.94, length / 2 + 0.23)
-      train.add(light)
+      parts.push({
+        geometry: new THREE.SphereGeometry(0.16, 8, 6),
+        color: 0xfff2a8,
+        position: [x, 0.94, length / 2 + 0.23],
+      })
     }
-
-    return train
+    return mergeColoredParts(parts)
   }
 
   private createRamp(centerZ: number, descending: boolean) {
     const ramp = new THREE.Group()
     const slope = new THREE.Group()
     const angle = Math.atan(TRAIN_ROOF_HEIGHT / RAMP_LENGTH) * (descending ? -1 : 1)
-    slope.position.set(0, TRAIN_ROOF_HEIGHT / 2, centerZ)
+    const slopeLength = Math.hypot(RAMP_LENGTH, TRAIN_ROOF_HEIGHT)
+    const deckThickness = 0.2
+    slope.position.set(0, TRAIN_ROOF_HEIGHT / 2 - Math.cos(angle) * deckThickness / 2, centerZ)
     slope.rotation.x = angle
-
-    const deck = mesh(new THREE.BoxGeometry(2.78, 0.2, RAMP_LENGTH), palette.blue, 0.52, 0.08)
-    slope.add(deck)
+    const slopeParts: ColoredGeometryPart[] = [{
+      geometry: new THREE.BoxGeometry(2.78, deckThickness, slopeLength),
+      color: palette.blue,
+    }]
     for (const side of [-1, 1]) {
-      const rail = mesh(new THREE.BoxGeometry(0.14, 0.25, RAMP_LENGTH + 0.08), palette.cream, 0.55, 0.08)
-      rail.position.set(side * 1.34, 0.18, 0)
-      slope.add(rail)
+      slopeParts.push({
+        geometry: new THREE.BoxGeometry(0.14, 0.25, slopeLength + 0.08),
+        color: palette.cream,
+        position: [side * 1.34, 0.18, 0],
+      })
     }
 
     const arrowShape = new THREE.Shape()
@@ -497,20 +660,34 @@ export class RunnerEngine {
     arrowShape.lineTo(-0.27, 0.08)
     arrowShape.lineTo(-0.62, 0.08)
     arrowShape.closePath()
-    for (const z of [-3.1, 0, 3.1]) {
-      const arrow = new THREE.Mesh(new THREE.ShapeGeometry(arrowShape), flatMaterial(palette.cream))
-      arrow.rotation.x = -Math.PI / 2
-      arrow.rotation.z = descending ? Math.PI : 0
-      arrow.position.set(0, 0.112, z)
-      slope.add(arrow)
+    for (const z of [-RAMP_LENGTH * 0.31, 0, RAMP_LENGTH * 0.31]) {
+      slopeParts.push({
+        geometry: new THREE.ShapeGeometry(arrowShape),
+        color: palette.cream,
+        position: [0, 0.112, z],
+        rotation: [-Math.PI / 2, 0, descending ? Math.PI : 0],
+      })
     }
+    const slopeMesh = new THREE.Mesh(mergeColoredParts(slopeParts), this.cityMaterial)
+    slopeMesh.receiveShadow = true
+    slope.add(slopeMesh)
     ramp.add(slope)
 
+    const supportParts: ColoredGeometryPart[] = []
     for (const side of [-1, 1]) {
-      const support = mesh(new THREE.BoxGeometry(0.14, TRAIN_ROOF_HEIGHT, 0.14), 0x315e81, 0.65, 0.22)
-      support.position.set(side * 1.1, TRAIN_ROOF_HEIGHT / 2, centerZ + (descending ? -RAMP_LENGTH * 0.42 : -RAMP_LENGTH * 0.42))
-      ramp.add(support)
+      supportParts.push({
+        geometry: new THREE.BoxGeometry(0.14, TRAIN_ROOF_HEIGHT, 0.14),
+        color: 0x315e81,
+        position: [
+          side * 1.1,
+          TRAIN_ROOF_HEIGHT / 2,
+          centerZ + (descending ? RAMP_LENGTH * 0.42 : -RAMP_LENGTH * 0.42),
+        ],
+      })
     }
+    const supportMesh = new THREE.Mesh(mergeColoredParts(supportParts), this.cityMaterial)
+    supportMesh.receiveShadow = true
+    ramp.add(supportMesh)
     return ramp
   }
 
@@ -529,18 +706,58 @@ export class RunnerEngine {
   }
 
   private createCoin(): Coin {
-    const group = new THREE.Group()
-    const disc = mesh(new THREE.CylinderGeometry(0.4, 0.4, 0.12, 22), palette.yellow, 0.2, 0.82)
-    disc.rotation.x = Math.PI / 2
-    disc.castShadow = true
-    const rim = mesh(new THREE.TorusGeometry(0.4, 0.055, 8, 22), 0xffe779, 0.16, 0.88)
-    const mark = new THREE.Mesh(new THREE.ShapeGeometry(createBoltShape(0.45)), flatMaterial(0xfff6bb))
-    mark.position.z = 0.075
-    const glow = new THREE.Mesh(new THREE.CircleGeometry(0.6, 20), flatMaterial(0xffdf64, 0.16))
-    glow.position.z = -0.09
-    group.add(glow, disc, rim, mark)
-    group.scale.setScalar(0.84)
-    return { mesh: group, lane: 1, collected: false, baseY: 1.1 }
+    return { mesh: new THREE.Group(), lane: 1, collected: false, baseY: 1.1 }
+  }
+
+  private createCoinInstances() {
+    const geometry = mergeColoredParts([
+      {
+        geometry: new THREE.CylinderGeometry(0.4, 0.4, 0.12, 14),
+        color: palette.yellow,
+        rotation: [Math.PI / 2, 0, 0],
+        scale: [0.84, 0.84, 0.84],
+      },
+      {
+        geometry: new THREE.TorusGeometry(0.4, 0.055, 6, 14),
+        color: 0xffe779,
+        scale: [0.84, 0.84, 0.84],
+      },
+      {
+        geometry: new THREE.ShapeGeometry(createBoltShape(0.45)),
+        color: 0xfff6bb,
+        position: [0, 0, 0.075],
+        scale: [0.84, 0.84, 0.84],
+      },
+      {
+        geometry: new THREE.ShapeGeometry(createBoltShape(0.45)),
+        color: 0xfff6bb,
+        position: [0, 0, -0.075],
+        rotation: [0, Math.PI, 0],
+        scale: [0.84, 0.84, 0.84],
+      },
+    ])
+    const instances = new THREE.InstancedMesh(geometry, this.cityMaterial, this.coins.length)
+    instances.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+    instances.castShadow = false
+    instances.receiveShadow = false
+    instances.frustumCulled = false
+    this.coinInstances = instances
+    this.scene.add(instances)
+  }
+
+  private syncCoinInstances() {
+    const instances = this.coinInstances
+    if (!instances) return
+    for (let index = 0; index < this.coins.length; index += 1) {
+      const coin = this.coins[index]
+      this.instanceTransform.position.copy(coin.mesh.position)
+      this.instanceTransform.rotation.copy(coin.mesh.rotation)
+      const inActiveRange = coin.mesh.position.z > -175 && coin.mesh.position.z < 22
+      this.instanceTransform.scale.setScalar(!coin.collected && coin.mesh.visible && inActiveRange ? 1 : 0)
+      this.instanceTransform.updateMatrix()
+      instances.setMatrixAt(index, this.instanceTransform.matrix)
+    }
+    instances.instanceMatrix.needsUpdate = true
   }
 
   private createEffects() {
@@ -552,12 +769,13 @@ export class RunnerEngine {
     this.landingRing = ring
     this.scene.add(ring)
 
-    for (let burstIndex = 0; burstIndex < 6; burstIndex += 1) {
+    const sparkleGeometry = new THREE.OctahedronGeometry(0.11, 0)
+    for (let burstIndex = 0; burstIndex < 4; burstIndex += 1) {
       const group = new THREE.Group()
       const burstMaterial = new THREE.MeshBasicMaterial({ color: 0xffe36c, transparent: true, opacity: 0 })
       const velocities: THREE.Vector3[] = []
-      for (let i = 0; i < 7; i += 1) {
-        const sparkle = new THREE.Mesh(new THREE.OctahedronGeometry(0.11, 0), burstMaterial)
+      for (let i = 0; i < 5; i += 1) {
+        const sparkle = new THREE.Mesh(sparkleGeometry, burstMaterial)
         group.add(sparkle)
         velocities.push(new THREE.Vector3())
       }
@@ -567,101 +785,128 @@ export class RunnerEngine {
     }
   }
 
-  private createTrackSegment(index: number) {
-    const group = new THREE.Group()
-    const trackBed = mesh(new THREE.BoxGeometry(12.2, 0.5, TRACK_LENGTH), palette.ballast, 0.98)
-    trackBed.position.y = -0.34
-    group.add(trackBed)
-
-    const railGeometry = new THREE.BoxGeometry(0.11, 0.14, TRACK_LENGTH)
-    const railInstances = new THREE.InstancedMesh(railGeometry, material(palette.rail, 0.22, 0.82), 6)
-    const railShadowInstances = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(0.2, 0.055, TRACK_LENGTH),
-      material(0x484b51, 0.9),
-      6,
-    )
-    const sleeperInstances = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(2.72, 0.105, 0.28),
-      material(palette.sleeper, 0.96),
-      27,
-    )
-    const instanceTransform = new THREE.Object3D()
-    let railIndex = 0
-    let sleeperIndex = 0
+  private createTrackSystem() {
+    const trackParts: ColoredGeometryPart[] = [{
+      geometry: new THREE.BoxGeometry(12.2, 0.5, TRACK_LENGTH),
+      color: palette.ballast,
+      position: [0, -0.34, 0],
+    }]
 
     for (let lane = 0; lane < LANES.length; lane += 1) {
-      const laneBed = mesh(
-        new THREE.BoxGeometry(2.8, 0.11, TRACK_LENGTH - 0.06),
-        lane === 1 ? 0x77747a : 0x838087,
-        0.95,
-      )
-      laneBed.position.set(LANES[lane], -0.055, 0)
-      group.add(laneBed)
-
+      trackParts.push({
+        geometry: new THREE.BoxGeometry(2.8, 0.11, TRACK_LENGTH - 0.06),
+        color: lane === 1 ? 0x77747a : 0x838087,
+        position: [LANES[lane], -0.055, 0],
+      })
       for (const offset of [-0.72, 0.72]) {
-        instanceTransform.position.set(LANES[lane] + offset, 0.13, 0)
-        instanceTransform.updateMatrix()
-        railInstances.setMatrixAt(railIndex, instanceTransform.matrix)
-        instanceTransform.position.y = 0.035
-        instanceTransform.updateMatrix()
-        railShadowInstances.setMatrixAt(railIndex, instanceTransform.matrix)
-        railIndex += 1
+        trackParts.push(
+          {
+            geometry: new THREE.BoxGeometry(0.2, 0.055, TRACK_LENGTH),
+            color: 0x484b51,
+            position: [LANES[lane] + offset, 0.035, 0],
+          },
+          {
+            geometry: new THREE.BoxGeometry(0.11, 0.14, TRACK_LENGTH),
+            color: palette.rail,
+            position: [LANES[lane] + offset, 0.13, 0],
+          },
+        )
       }
-
       for (let z = -8; z <= 8; z += 1.82) {
-        instanceTransform.position.set(LANES[lane], 0.025, z)
-        instanceTransform.updateMatrix()
-        sleeperInstances.setMatrixAt(sleeperIndex, instanceTransform.matrix)
-        sleeperIndex += 1
+        trackParts.push({
+          geometry: new THREE.BoxGeometry(2.72, 0.105, 0.28),
+          color: palette.sleeper,
+          position: [LANES[lane], 0.025, z],
+        })
       }
     }
-    railInstances.castShadow = true
-    railInstances.receiveShadow = true
-    railShadowInstances.receiveShadow = true
-    sleeperInstances.receiveShadow = true
-    group.add(railInstances, railShadowInstances, sleeperInstances)
 
     for (const side of [-1, 1]) {
-      const platform = mesh(new THREE.BoxGeometry(2.05, 0.62, TRACK_LENGTH), 0xd8c8a8, 0.92)
-      platform.position.set(side * 7.0, 0.04, 0)
-      group.add(platform)
-      const platformTop = mesh(new THREE.BoxGeometry(2.06, 0.11, TRACK_LENGTH), 0xf5e6c8, 0.82)
-      platformTop.position.set(side * 7.0, 0.405, 0)
-      group.add(platformTop)
-      const safetyLine = mesh(new THREE.BoxGeometry(0.24, 0.045, TRACK_LENGTH), palette.yellow, 0.58)
-      safetyLine.position.set(side * 6.02, 0.485, 0)
-      group.add(safetyLine)
-      const curb = mesh(new THREE.BoxGeometry(0.18, 0.7, TRACK_LENGTH), side < 0 ? palette.blue : palette.coral, 0.7)
-      curb.position.set(side * 5.95, 0.05, 0)
-      group.add(curb)
+      trackParts.push(
+        {
+          geometry: new THREE.BoxGeometry(2.05, 0.62, TRACK_LENGTH),
+          color: 0xd8c8a8,
+          position: [side * 7.0, 0.04, 0],
+        },
+        {
+          geometry: new THREE.BoxGeometry(2.06, 0.11, TRACK_LENGTH),
+          color: 0xf5e6c8,
+          position: [side * 7.0, 0.405, 0],
+        },
+        {
+          geometry: new THREE.BoxGeometry(0.24, 0.045, TRACK_LENGTH),
+          color: palette.yellow,
+          position: [side * 6.02, 0.485, 0],
+        },
+        {
+          geometry: new THREE.BoxGeometry(0.18, 0.7, TRACK_LENGTH),
+          color: side < 0 ? palette.blue : palette.coral,
+          position: [side * 5.95, 0.05, 0],
+        },
+      )
     }
-
     for (const x of [LANES[0], LANES[2]]) {
-      const wire = mesh(new THREE.BoxGeometry(0.018, 0.018, TRACK_LENGTH), 0x8da8b3, 0.45, 0.55)
-      wire.position.set(x, 6.45, 0)
-      wire.castShadow = false
-      group.add(wire)
+      trackParts.push({
+        geometry: new THREE.BoxGeometry(0.018, 0.018, TRACK_LENGTH),
+        color: 0x8da8b3,
+        position: [x, 6.45, 0],
+      })
     }
 
-    if (index % 3 === 1) {
-      for (const side of [-1, 1]) {
-        const mast = mesh(new THREE.CylinderGeometry(0.11, 0.15, 6.65, 8), 0x52758a, 0.55, 0.38)
-        mast.position.set(side * 5.72, 3.3, -7.4)
-        group.add(mast)
-      }
-      const gantry = mesh(new THREE.BoxGeometry(11.65, 0.17, 0.2), 0x52758a, 0.55, 0.38)
-      gantry.position.set(0, 6.42, -7.4)
-      group.add(gantry)
-      for (const x of [LANES[0], LANES[2]]) {
-        const hanger = mesh(new THREE.BoxGeometry(0.055, 0.7, 0.055), 0x52758a, 0.5, 0.35)
-        hanger.position.set(x, 6.02, -7.4)
-        group.add(hanger)
-      }
+    const overheadParts: ColoredGeometryPart[] = []
+    for (const side of [-1, 1]) {
+      overheadParts.push({
+        geometry: new THREE.CylinderGeometry(0.11, 0.15, 6.65, 8),
+        color: 0x52758a,
+        position: [side * 5.72, 3.3, -7.4],
+      })
+    }
+    overheadParts.push({
+      geometry: new THREE.BoxGeometry(11.65, 0.17, 0.2),
+      color: 0x52758a,
+      position: [0, 6.42, -7.4],
+    })
+    for (const x of [LANES[0], LANES[2]]) {
+      overheadParts.push({
+        geometry: new THREE.BoxGeometry(0.055, 0.7, 0.055),
+        color: 0x52758a,
+        position: [x, 6.02, -7.4],
+      })
     }
 
-    group.position.z = -index * TRACK_LENGTH + 9
-    this.tracks.push(group)
-    this.scene.add(group)
+    const tracks = new THREE.InstancedMesh(mergeColoredParts(trackParts), this.cityMaterial, TRACK_SEGMENTS)
+    tracks.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+    tracks.receiveShadow = true
+    tracks.frustumCulled = false
+    this.trackInstances = tracks
+    const overheadCount = Math.floor((TRACK_SEGMENTS + 1) / 3)
+    const overhead = new THREE.InstancedMesh(mergeColoredParts(overheadParts), this.cityMaterial, overheadCount)
+    overhead.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+    overhead.frustumCulled = false
+    this.overheadInstances = overhead
+    for (let index = 0; index < TRACK_SEGMENTS; index += 1) {
+      this.trackZs[index] = -index * TRACK_LENGTH + 9
+    }
+    this.syncTrackInstances()
+    this.scene.add(tracks, overhead)
+  }
+
+  private syncTrackInstances() {
+    if (!this.trackInstances || !this.overheadInstances) return
+    let overheadIndex = 0
+    for (let index = 0; index < TRACK_SEGMENTS; index += 1) {
+      this.instanceTransform.position.set(0, 0, this.trackZs[index])
+      this.instanceTransform.rotation.set(0, 0, 0)
+      this.instanceTransform.scale.set(1, 1, 1)
+      this.instanceTransform.updateMatrix()
+      this.trackInstances.setMatrixAt(index, this.instanceTransform.matrix)
+      if (index % 3 === 1) {
+        this.overheadInstances.setMatrixAt(overheadIndex, this.instanceTransform.matrix)
+        overheadIndex += 1
+      }
+    }
+    this.trackInstances.instanceMatrix.needsUpdate = true
+    this.overheadInstances.instanceMatrix.needsUpdate = true
   }
 
   private createScenery(index: number) {
@@ -671,112 +916,129 @@ export class RunnerEngine {
     const width = 4 + ((index * 3) % 4)
     const buildingColors = [0xff856a, 0x4dbfc0, 0xffd06d, 0x6e82df, 0xa56bd8, 0x60b97a]
     const buildingX = side * (10.5 + (index % 3) * 1.5)
-    const body = mesh(
-      new THREE.BoxGeometry(width, height, 5.8),
-      buildingColors[index % buildingColors.length],
-      0.84,
-    )
-    body.position.set(buildingX, height / 2 + 0.3, 0)
-    group.add(body)
+    const parts: ColoredGeometryPart[] = [
+      {
+        geometry: new THREE.BoxGeometry(width, height, 5.8),
+        color: buildingColors[index % buildingColors.length],
+        position: [buildingX, height / 2 + 0.3, 0],
+      },
+      {
+        geometry: new THREE.BoxGeometry(width + 0.35, 0.32, 6.15),
+        color: index % 2 ? palette.coral : palette.yellow,
+        position: [buildingX, height + 0.48, 0],
+      },
+    ]
 
-    const roof = mesh(
-      new THREE.BoxGeometry(width + 0.35, 0.32, 6.15),
-      index % 2 ? palette.coral : palette.yellow,
-      0.72,
-    )
-    roof.position.set(buildingX, height + 0.48, 0)
-    group.add(roof)
-
-    const windowMaterial = flatMaterial(index % 3 === 0 ? 0xe9fbff : 0x254d74)
-    const windowPositions: Array<{ y: number; z: number }> = []
+    const windowColor = index % 3 === 0 ? 0xe9fbff : 0x254d74
     for (let y = 1.7; y < height - 0.45; y += 1.55) {
       for (const z of [-1.55, 0, 1.55]) {
-        windowPositions.push({ y, z })
+        parts.push({
+          geometry: new THREE.BoxGeometry(0.045, 0.78, 0.62),
+          color: windowColor,
+          position: [buildingX - side * (width / 2 + 0.025), y, z],
+        })
       }
     }
-    const windowInstances = new THREE.InstancedMesh(
-      new THREE.PlaneGeometry(0.62, 0.78),
-      windowMaterial,
-      windowPositions.length,
-    )
-    const windowTransform = new THREE.Object3D()
-    windowPositions.forEach((position, windowIndex) => {
-      windowTransform.position.set(buildingX - side * (width / 2 + 0.012), position.y, position.z)
-      windowTransform.rotation.y = side < 0 ? Math.PI / 2 : -Math.PI / 2
-      windowTransform.updateMatrix()
-      windowInstances.setMatrixAt(windowIndex, windowTransform.matrix)
+    parts.push({
+      geometry: new THREE.BoxGeometry(1.5, 0.16, 2.8),
+      color: index % 2 ? palette.cyan : palette.cream,
+      position: [buildingX - side * (width / 2 + 0.7), 2.0, 0],
+      rotation: [0, 0, side * 0.08],
     })
-    windowInstances.castShadow = false
-    group.add(windowInstances)
-
-    const awning = mesh(new THREE.BoxGeometry(1.5, 0.16, 2.8), index % 2 ? palette.cyan : palette.cream, 0.68)
-    awning.position.set(buildingX - side * (width / 2 + 0.7), 2.0, 0)
-    awning.rotation.z = side * 0.08
-    group.add(awning)
 
     const fenceColor = index % 2 ? 0x3d7185 : 0x4e6684
     for (const z of [-3.9, 0, 3.9]) {
-      const fencePost = mesh(new THREE.BoxGeometry(0.11, 1.25, 0.11), fenceColor, 0.6, 0.25)
-      fencePost.position.set(side * 8.15, 1.0, z)
-      group.add(fencePost)
+      parts.push({
+        geometry: new THREE.BoxGeometry(0.11, 1.25, 0.11),
+        color: fenceColor,
+        position: [side * 8.15, 1.0, z],
+      })
     }
     for (const y of [0.65, 1.28]) {
-      const fenceRail = mesh(new THREE.BoxGeometry(0.09, 0.09, 7.8), fenceColor, 0.6, 0.25)
-      fenceRail.position.set(side * 8.15, y, 0)
-      group.add(fenceRail)
+      parts.push({
+        geometry: new THREE.BoxGeometry(0.09, 0.09, 7.8),
+        color: fenceColor,
+        position: [side * 8.15, y, 0],
+      })
     }
 
     if (index % 3 !== 1) {
-      const trunk = mesh(new THREE.CylinderGeometry(0.18, 0.25, 2.15, 8), 0x8a5738, 0.95)
-      trunk.position.set(side * 8.9, 1.45, 2.6)
-      const leaves = mesh(new THREE.IcosahedronGeometry(1.2, 1), index % 2 ? 0x43b967 : 0x66c75d, 0.92)
-      leaves.position.set(side * 8.9, 3.25, 2.6)
-      const accentLeaves = mesh(new THREE.IcosahedronGeometry(0.72, 1), index % 4 === 0 ? 0xff70a5 : 0x8dde6e, 0.9)
-      accentLeaves.position.set(side * 8.55, 3.65, 2.35)
-      group.add(trunk, leaves, accentLeaves)
+      parts.push(
+        {
+          geometry: new THREE.CylinderGeometry(0.18, 0.25, 2.15, 7),
+          color: 0x8a5738,
+          position: [side * 8.9, 1.45, 2.6],
+        },
+        {
+          geometry: new THREE.IcosahedronGeometry(1.2, 0),
+          color: index % 2 ? 0x43b967 : 0x66c75d,
+          position: [side * 8.9, 3.25, 2.6],
+        },
+        {
+          geometry: new THREE.IcosahedronGeometry(0.72, 0),
+          color: index % 4 === 0 ? 0xff70a5 : 0x8dde6e,
+          position: [side * 8.55, 3.65, 2.35],
+        },
+      )
     }
 
-    const lampPost = mesh(new THREE.CylinderGeometry(0.07, 0.1, 4.2, 8), 0x31576e, 0.58, 0.28)
-    lampPost.position.set(side * 7.15, 2.55, -3.4)
-    const lampArm = mesh(new THREE.BoxGeometry(0.9, 0.09, 0.09), 0x31576e, 0.58, 0.28)
-    lampArm.position.set(side * 6.75, 4.58, -3.4)
-    const lamp = mesh(new THREE.SphereGeometry(0.2, 10, 8), 0xffed9d, 0.28)
-    lamp.position.set(side * 6.35, 4.38, -3.4)
-    group.add(lampPost, lampArm, lamp)
-
-    const banner = mesh(new THREE.BoxGeometry(0.06, 1.3, 0.9), index % 2 ? palette.purple : palette.orange, 0.72)
-    banner.position.set(side * 7.0, 3.35, -3.38)
-    const bannerMark = new THREE.Mesh(new THREE.ShapeGeometry(createBoltShape(0.38)), flatMaterial(palette.cream))
-    bannerMark.position.set(side * 6.955, 3.34, -3.87)
-    bannerMark.rotation.y = side > 0 ? Math.PI / 2 : -Math.PI / 2
-    bannerMark.rotation.z = -0.08
-    group.add(banner, bannerMark)
+    parts.push(
+      {
+        geometry: new THREE.CylinderGeometry(0.07, 0.1, 4.2, 7),
+        color: 0x31576e,
+        position: [side * 7.15, 2.55, -3.4],
+      },
+      {
+        geometry: new THREE.BoxGeometry(0.9, 0.09, 0.09),
+        color: 0x31576e,
+        position: [side * 6.75, 4.58, -3.4],
+      },
+      {
+        geometry: new THREE.SphereGeometry(0.2, 8, 6),
+        color: 0xffed9d,
+        position: [side * 6.35, 4.38, -3.4],
+      },
+      {
+        geometry: new THREE.BoxGeometry(0.06, 1.3, 0.9),
+        color: index % 2 ? palette.purple : palette.orange,
+        position: [side * 7.0, 3.35, -3.38],
+      },
+    )
 
     if (index % 8 === 5) {
       const bridgeColor = index % 16 === 5 ? 0x3e76a3 : 0xe96855
       for (const bridgeSide of [-1, 1]) {
-        const support = mesh(new THREE.BoxGeometry(0.7, 11.1, 0.75), bridgeColor, 0.75)
-        support.position.set(bridgeSide * 7.9, 5.6, 0)
-        group.add(support)
+        parts.push({
+          geometry: new THREE.BoxGeometry(0.7, 11.1, 0.75),
+          color: bridgeColor,
+          position: [bridgeSide * 7.9, 5.6, 0],
+        })
       }
-      const bridge = mesh(new THREE.BoxGeometry(16.4, 0.76, 1.1), bridgeColor, 0.72)
-      bridge.position.set(0, 10.72, 0)
-      group.add(bridge)
-      const bridgePanel = mesh(new THREE.BoxGeometry(5.2, 0.52, 0.12), palette.cream, 0.65)
-      bridgePanel.position.set(0, 10.72, 0.61)
-      group.add(bridgePanel)
+      parts.push(
+        {
+          geometry: new THREE.BoxGeometry(16.4, 0.76, 1.1),
+          color: bridgeColor,
+          position: [0, 10.72, 0],
+        },
+        {
+          geometry: new THREE.BoxGeometry(5.2, 0.52, 0.12),
+          color: palette.cream,
+          position: [0, 10.72, 0.61],
+        },
+      )
       for (const x of [-1.5, 0, 1.5]) {
-        const bolt = new THREE.Mesh(new THREE.ShapeGeometry(createBoltShape(0.24)), flatMaterial(x === 0 ? palette.coral : palette.blue))
-        bolt.position.set(x, 10.72, 0.685)
-        group.add(bolt)
+        parts.push({
+          geometry: new THREE.ShapeGeometry(createBoltShape(0.24)),
+          color: x === 0 ? palette.coral : palette.blue,
+          position: [x, 10.72, 0.685],
+        })
       }
     }
 
-    group.traverse((object) => {
-      if (object instanceof THREE.Mesh) object.castShadow = false
-    })
-    body.castShadow = true
-    roof.castShadow = true
+    const visual = new THREE.Mesh(mergeColoredParts(parts), this.cityMaterial)
+    visual.castShadow = false
+    visual.receiveShadow = false
+    group.add(visual)
     group.position.set(0, 0, -index * 13.5)
     this.scenery.push(group)
     this.scene.add(group)
@@ -854,76 +1116,110 @@ export class RunnerEngine {
 
     this.player.position.set(0, 0, PLAYER_Z)
     this.player.rotation.y = Math.PI
+    this.player.traverse((object) => {
+      if (object instanceof THREE.Mesh) object.castShadow = true
+    })
     this.scene.add(this.player)
   }
 
   private createHazard(kind: HazardKind): Hazard {
     const group = new THREE.Group()
-    this.buildHazard(group, kind, 0)
-    return { group, kind, lane: 1, hit: false, variant: 0 }
+    const visual = new THREE.Mesh(this.getHazardGeometry(kind, 0), this.cityMaterial)
+    visual.castShadow = true
+    visual.receiveShadow = true
+    group.add(visual)
+    return { group, visual, kind, lane: 1, hit: false, variant: 0 }
   }
 
-  private buildHazard(group: THREE.Group, kind: HazardKind, variant: number) {
-    group.traverse((object) => {
-      if (!(object instanceof THREE.Mesh)) return
-      object.geometry.dispose()
-      if (Array.isArray(object.material)) object.material.forEach((item) => item.dispose())
-      else object.material.dispose()
-    })
-    group.clear()
-    if (kind === 'block') {
-      group.add(this.createTrainVisual(variant, 6.1, false))
-    } else if (kind === 'jump') {
-      const barrier = mesh(new THREE.BoxGeometry(2.72, 0.78, 0.54), palette.coral, 0.58)
-      barrier.position.y = 0.78
-      group.add(barrier)
+  private getHazardGeometry(kind: HazardKind, variant: number) {
+    if (kind === 'block') return this.getTrainGeometry(variant, OBSTACLE_TRAIN_LENGTH, false)
+    const cacheKey = kind
+    const cached = this.hazardGeometryCache.get(cacheKey)
+    if (cached) return cached
+    const parts: ColoredGeometryPart[] = []
+    if (kind === 'jump') {
+      parts.push({
+        geometry: new THREE.BoxGeometry(2.72, 0.78, 0.54),
+        color: palette.coral,
+        position: [0, 0.78, 0],
+      })
       for (const x of [-0.92, -0.31, 0.31, 0.92]) {
-        const stripe = mesh(new THREE.BoxGeometry(0.24, 0.82, 0.58), palette.cream, 0.58)
-        stripe.position.set(x, 0.79, 0)
-        stripe.rotation.z = -0.28
-        group.add(stripe)
+        parts.push({
+          geometry: new THREE.BoxGeometry(0.24, 0.82, 0.58),
+          color: palette.cream,
+          position: [x, 0.79, 0],
+          rotation: [0, 0, -0.28],
+        })
       }
-      const foot = mesh(new THREE.BoxGeometry(3, 0.16, 0.98), 0x24354b, 0.72, 0.15)
-      foot.position.y = 0.08
-      group.add(foot)
+      parts.push({
+        geometry: new THREE.BoxGeometry(3, 0.16, 0.98),
+        color: 0x24354b,
+        position: [0, 0.08, 0],
+      })
       for (const x of [-1.12, 1.12]) {
-        const post = mesh(new THREE.BoxGeometry(0.17, 1.36, 0.18), 0x344f62, 0.65, 0.25)
-        post.position.set(x, 0.68, -0.12)
-        const warning = mesh(new THREE.SphereGeometry(0.16, 10, 8), 0xff3b45, 0.2)
-        warning.position.set(x, 1.48, 0.04)
-        group.add(post, warning)
+        parts.push(
+          {
+            geometry: new THREE.BoxGeometry(0.17, 1.36, 0.18),
+            color: 0x344f62,
+            position: [x, 0.68, -0.12],
+          },
+          {
+            geometry: new THREE.SphereGeometry(0.16, 8, 6),
+            color: 0xff3b45,
+            position: [x, 1.48, 0.04],
+          },
+        )
       }
     } else {
-      const leftPost = mesh(new THREE.BoxGeometry(0.2, 3.05, 0.24), 0x315e7a, 0.58, 0.25)
-      leftPost.position.set(-1.25, 1.52, 0)
-      const rightPost = leftPost.clone()
-      rightPost.position.x = 1.25
-      const beam = mesh(new THREE.BoxGeometry(2.82, 0.88, 0.52), palette.cream, 0.6)
-      beam.position.y = 2.45
-      group.add(leftPost, rightPost, beam)
-      const signFace = mesh(new THREE.BoxGeometry(2.4, 0.56, 0.08), palette.blue, 0.42)
-      signFace.position.set(0, 2.46, 0.31)
-      group.add(signFace)
+      parts.push(
+        {
+          geometry: new THREE.BoxGeometry(0.2, 3.05, 0.24),
+          color: 0x315e7a,
+          position: [-1.25, 1.52, 0],
+        },
+        {
+          geometry: new THREE.BoxGeometry(0.2, 3.05, 0.24),
+          color: 0x315e7a,
+          position: [1.25, 1.52, 0],
+        },
+        {
+          geometry: new THREE.BoxGeometry(2.82, 0.88, 0.52),
+          color: palette.cream,
+          position: [0, 2.45, 0],
+        },
+        {
+          geometry: new THREE.BoxGeometry(2.4, 0.56, 0.08),
+          color: palette.blue,
+          position: [0, 2.46, 0.31],
+        },
+      )
       for (const x of [-0.72, 0, 0.72]) {
-        const arrow = new THREE.Mesh(new THREE.ShapeGeometry(createBoltShape(0.22)), flatMaterial(palette.cream))
-        arrow.position.set(x, 2.45, 0.36)
-        group.add(arrow)
+        parts.push({
+          geometry: new THREE.ShapeGeometry(createBoltShape(0.22)),
+          color: palette.cream,
+          position: [x, 2.45, 0.36],
+        })
       }
-      const clearance = mesh(new THREE.BoxGeometry(2.35, 0.1, 0.13), palette.coral, 0.55)
-      clearance.position.set(0, 1.86, 0)
-      group.add(clearance)
+      parts.push({
+        geometry: new THREE.BoxGeometry(2.35, 0.1, 0.13),
+        color: palette.coral,
+        position: [0, 1.86, 0],
+      })
     }
+    const geometry = mergeColoredParts(parts)
+    this.hazardGeometryCache.set(cacheKey, geometry)
+    return geometry
   }
 
   private getRouteSurfaceAtLocalZ(localZ: number) {
-    if (localZ <= ROUTE_UP_FRONT && localZ >= ROUTE_UP_BACK) {
-      return ((ROUTE_UP_FRONT - localZ) / RAMP_LENGTH) * TRAIN_ROOF_HEIGHT
-    }
-    if (localZ < ROUTE_UP_BACK && localZ >= ROUTE_ROOF_BACK) return TRAIN_ROOF_HEIGHT
-    if (localZ < ROUTE_ROOF_BACK && localZ >= ROUTE_DOWN_BACK) {
-      return ((localZ - ROUTE_DOWN_BACK) / RAMP_LENGTH) * TRAIN_ROOF_HEIGHT
-    }
-    return 0
+    return getRouteSurfaceHeight(
+      localZ,
+      ROUTE_UP_FRONT,
+      ROUTE_UP_BACK,
+      ROUTE_ROOF_BACK,
+      ROUTE_DOWN_BACK,
+      TRAIN_ROOF_HEIGHT,
+    )
   }
 
   private getRouteSurfaceAtWorldZ(lane: number, worldZ: number) {
@@ -933,6 +1229,23 @@ export class RunnerEngine {
       height = Math.max(height, this.getRouteSurfaceAtLocalZ(worldZ - route.group.position.z))
     }
     return height
+  }
+
+  private getObstacleTrainRoofAtWorldZ(lane: number, worldZ: number) {
+    for (const hazard of this.hazards) {
+      if (hazard.kind !== 'block' || hazard.lane !== lane) continue
+      if (Math.abs(hazard.group.position.z - worldZ) <= OBSTACLE_TRAIN_LENGTH / 2 - 0.12) {
+        return OBSTACLE_TRAIN_ROOF_HEIGHT
+      }
+    }
+    return 0
+  }
+
+  private getSupportSurfaceAtWorldZ(lane: number, worldZ: number) {
+    return Math.max(
+      this.getRouteSurfaceAtWorldZ(lane, worldZ),
+      this.getObstacleTrainRoofAtWorldZ(lane, worldZ),
+    )
   }
 
   private routeOccupies(lane: number, worldZ: number, margin = 2.5) {
@@ -969,10 +1282,10 @@ export class RunnerEngine {
   }
 
   private resetWorldObjects() {
-    this.placeRoofRoute(this.roofRoutes[0], 1, -82)
-    this.placeRoofRoute(this.roofRoutes[1], 0, -232)
+    this.placeRoofRoute(this.roofRoutes[0], 1, this.roofTestMode ? -34 : -82)
+    this.placeRoofRoute(this.roofRoutes[1], 0, this.roofTestMode ? -34 : -232)
 
-    let hazardZ = -36
+    let hazardZ = this.roofTestMode ? -190 : -36
     this.hazards.forEach((hazard, index) => {
       hazardZ -= 22 + (index % 3) * 4
       const kind: HazardKind = index % 3 === 0 ? 'jump' : index % 3 === 1 ? 'block' : 'slide'
@@ -980,7 +1293,7 @@ export class RunnerEngine {
       this.updateHazard(hazard, kind, lane, hazardZ, (index + lane) % trainThemes.length)
     })
 
-    const routeCoinZs = [16.5, 14, 11.2, 8, 4, 0, -4, -8, -12, -17, -22, -26]
+    const routeCoinZs = [17.2, 15.2, 12.4, 8, 4, 0, -4, -8, -12, -17, -21.5, -24.2]
     const routeCoinCount = routeCoinZs.length * this.roofRoutes.length
     let groundCoinZ = -20
     this.coins.forEach((coin, index) => {
@@ -1013,10 +1326,13 @@ export class RunnerEngine {
       coin.mesh.position.set(LANES[lane], coin.baseY, z)
       coin.mesh.rotation.y = 0
     })
+    this.syncCoinInstances()
   }
 
   private updateHazard(hazard: Hazard, kind: HazardKind, lane: number, z: number, variant: number) {
-    if (hazard.kind !== kind || hazard.variant !== variant) this.buildHazard(hazard.group, kind, variant)
+    if (hazard.kind !== kind || hazard.variant !== variant) {
+      hazard.visual.geometry = this.getHazardGeometry(kind, variant)
+    }
     hazard.kind = kind
     hazard.lane = lane
     hazard.variant = variant
@@ -1152,6 +1468,63 @@ export class RunnerEngine {
     else this.updateIdle(delta)
 
     this.renderer.render(this.scene, this.camera)
+    if (this.profiling) this.updateProfile(rawDelta)
+  }
+
+  private updateProfile(rawDelta: number) {
+    this.profileElapsed += rawDelta
+    this.profileStateElapsed += rawDelta
+    this.profileFrames += 1
+    this.profileFrameTimes.push(rawDelta * 1000)
+    const canvas = this.renderer.domElement
+    if (this.profileStateElapsed >= 0.1) {
+      canvas.dataset.motionState = JSON.stringify({
+        lane: this.laneIndex,
+        supportLane: this.supportLaneIndex,
+        surfaceHeight: this.surfaceHeight,
+        surfaceTransition: this.surfaceTransitionKind,
+        jumpHeight: this.jumpMotion.height,
+        crouching: this.isCrouching(),
+        status: this.status,
+        distance: this.distance,
+      })
+      this.profileStateElapsed = 0
+    }
+    if (this.profileElapsed < 4) return
+
+    const sortedFrameTimes = [...this.profileFrameTimes].sort((a, b) => a - b)
+    const percentile = (ratio: number) => sortedFrameTimes[
+      Math.min(sortedFrameTimes.length - 1, Math.floor(sortedFrameTimes.length * ratio))
+    ] ?? 0
+    let sceneObjects = 0
+    this.scene.traverse(() => { sceneObjects += 1 })
+    canvas.dataset.profile = JSON.stringify({
+      fps: this.profileFrames / this.profileElapsed,
+      p50Ms: percentile(0.5),
+      p95Ms: percentile(0.95),
+      p99Ms: percentile(0.99),
+      maxMs: sortedFrameTimes[sortedFrameTimes.length - 1] ?? 0,
+      calls: this.renderer.info.render.calls,
+      triangles: this.renderer.info.render.triangles,
+      geometries: this.renderer.info.memory.geometries,
+      textures: this.renderer.info.memory.textures,
+      programs: this.renderer.info.programs?.length ?? 0,
+      sceneObjects,
+      bufferWidth: canvas.width,
+      bufferHeight: canvas.height,
+      pixelRatio: this.renderer.getPixelRatio(),
+      lane: this.laneIndex,
+      supportLane: this.supportLaneIndex,
+      surfaceHeight: this.surfaceHeight,
+      surfaceTransition: this.surfaceTransitionKind,
+      status: this.status,
+      distance: this.distance,
+      rampLength: RAMP_LENGTH,
+      routePositions: this.roofRoutes.map((route) => ({ lane: route.lane, z: route.group.position.z })),
+    })
+    this.profileElapsed = 0
+    this.profileFrames = 0
+    this.profileFrameTimes.length = 0
   }
 
   private updateGame(delta: number) {
@@ -1187,28 +1560,34 @@ export class RunnerEngine {
       coin.mesh.rotation.y += delta * 2.1
       coin.mesh.rotation.z = Math.sin(this.elapsed * 2 + coin.mesh.position.z) * 0.12
     })
+    this.syncCoinInstances()
   }
 
   private updateWorld(travel: number, delta: number) {
     const totalTrackLength = TRACK_LENGTH * TRACK_SEGMENTS
-    this.tracks.forEach((track) => {
-      track.position.z += travel
-      if (track.position.z > 18) track.position.z -= totalTrackLength
-    })
+    for (let index = 0; index < this.trackZs.length; index += 1) {
+      this.trackZs[index] += travel
+      if (this.trackZs[index] > 18) this.trackZs[index] -= totalTrackLength
+    }
+    this.syncTrackInstances()
 
     this.scenery.forEach((item) => {
       item.position.z += travel * 0.92
       if (item.position.z > 34) item.position.z -= this.scenery.length * 13.5
+      item.visible = item.position.z > -178 && item.position.z < 42
     })
 
     this.roofRoutes.forEach((route) => {
       route.group.position.z += travel
       if (route.group.position.z > PLAYER_Z - ROUTE_DOWN_BACK + 7) this.recycleRoofRoute(route)
+      route.group.visible = route.group.position.z + ROUTE_UP_FRONT > -185 &&
+        route.group.position.z + ROUTE_DOWN_BACK < 32
     })
 
     this.hazards.forEach((hazard) => {
       hazard.group.position.z += travel
       if (hazard.group.position.z > 15) this.recycleHazard(hazard)
+      hazard.group.visible = hazard.group.position.z > -175 && hazard.group.position.z < 22
     })
 
     this.coins.forEach((coin) => {
@@ -1224,6 +1603,7 @@ export class RunnerEngine {
       coin.mesh.position.y = coin.baseY + Math.sin(this.elapsed * 5.5 + coin.mesh.position.z * 0.16) * 0.08
       if (!coin.route && coin.mesh.position.z > 13) this.recycleCoin(coin)
     })
+    this.syncCoinInstances()
 
     this.updateEffects(delta)
   }
@@ -1234,15 +1614,47 @@ export class RunnerEngine {
     this.player.rotation.z = THREE.MathUtils.lerp(this.player.rotation.z, -xDelta * 0.07, Math.min(1, delta * 18))
 
     this.previousSurfaceHeight = this.surfaceHeight
-    const nearTargetLane = Math.abs(this.player.position.x - LANES[this.laneIndex]) < 1.28
-    const routeSurface = nearTargetLane
-      ? this.getRouteSurfaceAtWorldZ(this.laneIndex, PLAYER_Z)
-      : 0
-    if (routeSurface > 0 || this.surfaceHeight < 0.035) {
-      this.surfaceHeight = routeSurface
-    } else {
-      this.surfaceHeight = THREE.MathUtils.lerp(this.surfaceHeight, 0, 1 - Math.exp(-delta * 7.5))
+    const sourceLane = this.supportLaneIndex
+    const sourceSurface = this.getSupportSurfaceAtWorldZ(sourceLane, PLAYER_Z)
+    const destinationRouteSurface = this.getRouteSurfaceAtWorldZ(this.laneIndex, PLAYER_Z)
+    const destinationTrainSurface = this.getObstacleTrainRoofAtWorldZ(this.laneIndex, PLAYER_Z)
+    const destinationSurface = Math.max(destinationRouteSurface, destinationTrainSurface)
+    const transitionDistance = Math.abs(LANES[this.laneIndex] - LANES[sourceLane])
+    const transitionProgress = transitionDistance < 0.01
+      ? 1
+      : 1 - Math.abs(LANES[this.laneIndex] - this.player.position.x) / transitionDistance
+    const transitionInput = this.surfaceTransitionInput
+    transitionInput.sourceLane = sourceLane
+    transitionInput.destinationLane = this.laneIndex
+    transitionInput.sourceSurface = sourceSurface
+    transitionInput.destinationSurface = destinationSurface
+    transitionInput.intermediateSurface = Math.abs(sourceLane - this.laneIndex) === 2
+      ? this.getSupportSurfaceAtWorldZ(1, PLAYER_Z)
+      : undefined
+    transitionInput.progress = transitionProgress
+    const transition = resolveSurfaceTransition(transitionInput, this.surfaceTransitionResult)
+    if (
+      sourceLane === this.laneIndex &&
+      destinationTrainSurface > 0 &&
+      destinationRouteSurface <= 0 &&
+      this.previousSurfaceHeight < destinationTrainSurface - 0.4
+    ) {
+      transition.height = this.previousSurfaceHeight
+      transition.kind = 'unsupported'
+      transition.destinationSupported = false
+    }
+    this.surfaceTransitionKind = transition.kind
+    if (transition.kind === 'same-lane' && destinationSurface <= 0 && this.surfaceHeight >= 0.035) {
+      this.surfaceHeight = THREE.MathUtils.lerp(this.surfaceHeight, 0, 1 - Math.exp(-delta * 8.5))
       if (this.surfaceHeight < 0.018) this.surfaceHeight = 0
+    } else {
+      this.surfaceHeight = Math.max(0, transition.height)
+    }
+    if (
+      Math.abs(this.player.position.x - LANES[this.laneIndex]) < 0.18 &&
+      transition.destinationSupported
+    ) {
+      this.supportLaneIndex = this.laneIndex
     }
     if (this.previousSurfaceHeight < TRAIN_ROOF_HEIGHT - 0.08 && this.surfaceHeight >= TRAIN_ROOF_HEIGHT - 0.02) {
       this.triggerLandingEffect()
@@ -1440,16 +1852,31 @@ export class RunnerEngine {
       const collisionDepth = hazard.kind === 'block' ? 3.0 : 1.36
       if (zDistance < collisionDepth && xDistance < 1.08) {
         const sliding = this.isCrouching()
+        const safelyOnTrainRoof = hazard.kind === 'block' && isSafelyAboveTrainRoof(
+          this.surfaceHeight + this.jumpMotion.height,
+          OBSTACLE_TRAIN_ROOF_HEIGHT,
+        )
         const safe =
           (hazard.kind === 'jump' && this.jumpMotion.height > JUMP_CLEARANCE_HEIGHT) ||
-          (hazard.kind === 'slide' && sliding)
+          (hazard.kind === 'slide' && sliding) ||
+          safelyOnTrainRoof
         if (!safe) {
           hazard.hit = true
-          this.status = 'gameover'
-          this.player.rotation.z = playerX < 0 ? 0.38 : -0.38
-          this.options.onCrash(this.getSnapshot())
+          this.crash()
           return
         }
+      }
+    }
+
+    if (this.surfaceTransitionKind === 'unsupported') {
+      const targetRouteSurface = this.getRouteSurfaceAtWorldZ(this.laneIndex, PLAYER_Z)
+      if (
+        targetRouteSurface > 0.62 &&
+        Math.abs(LANES[this.laneIndex] - playerX) < 1.08 &&
+        !isSafelyAboveTrainRoof(this.surfaceHeight + this.jumpMotion.height, targetRouteSurface)
+      ) {
+        this.crash()
+        return
       }
     }
 
@@ -1468,6 +1895,12 @@ export class RunnerEngine {
         this.options.onCoin()
       }
     }
+  }
+
+  private crash() {
+    this.status = 'gameover'
+    this.player.rotation.z = this.player.position.x < 0 ? 0.38 : -0.38
+    this.options.onCrash(this.getSnapshot())
   }
 
   private getSnapshot(): GameSnapshot {
