@@ -26,6 +26,82 @@ export interface SurfaceTransitionResult {
   destinationSupported: boolean
 }
 
+export interface LandingSurfaceCandidate {
+  lane: number
+  height: number
+  kind: 'ground' | 'ramp' | 'roof'
+}
+
+/** Selects the highest valid support directly beneath the runner's feet. */
+export function resolveLandingSurfaceCandidate(
+  playerX: number,
+  supportHalfWidth: number,
+  laneCenters: readonly number[],
+  surfaceHeights: readonly number[],
+  surfaceKinds?: readonly LandingSurfaceCandidate['kind'][],
+  output?: LandingSurfaceCandidate,
+) {
+  const result = output ?? { lane: 0, height: 0, kind: 'ground' }
+  result.lane = 0
+  result.height = 0
+  result.kind = 'ground'
+
+  if (!Number.isFinite(playerX) || !Number.isFinite(supportHalfWidth) || supportHalfWidth < 0) {
+    return result
+  }
+
+  for (let lane = 0; lane < laneCenters.length; lane += 1) {
+    if (Math.abs(playerX - laneCenters[lane]) > supportHalfWidth) continue
+    const height = surfaceHeights[lane] ?? 0
+    if (!Number.isFinite(height) || height <= result.height) continue
+    result.lane = lane
+    result.height = height
+    result.kind = surfaceKinds?.[lane] ?? 'roof'
+  }
+
+  return result
+}
+
+export function didDescendingFeetCrossMovingRamp(
+  previousFeetY: number,
+  nextFeetY: number,
+  nextVelocity: number,
+  previousSurface: LandingSurfaceCandidate,
+  currentSurface: LandingSurfaceCandidate,
+) {
+  if (
+    nextVelocity >= 0 ||
+    currentSurface.kind !== 'ramp' ||
+    !Number.isFinite(previousFeetY) ||
+    !Number.isFinite(nextFeetY) ||
+    !Number.isFinite(currentSurface.height)
+  ) return false
+
+  const previousSurfaceHeight = previousSurface.kind === 'ramp' &&
+    previousSurface.lane === currentSurface.lane
+    ? previousSurface.height
+    : 0
+  return previousFeetY >= previousSurfaceHeight - 1e-6 &&
+    nextFeetY <= currentSurface.height + 1e-6
+}
+
+/** Grounded roof-to-roof lane changes are valid top traversal, not side impacts. */
+export function isValidAdjacentRoofTransfer(
+  airborne: boolean,
+  transitionKind: SurfaceTransitionKind,
+) {
+  return !airborne && transitionKind === 'roof-to-roof'
+}
+
+/** Roof endpoints are valid; positions beyond them belong to the lethal train body. */
+export function isInsideLongitudinalRoofFootprint(
+  worldZ: number,
+  roofCenterZ: number,
+  roofHalfLength: number,
+) {
+  return roofHalfLength > 0 && Math.abs(worldZ - roofCenterZ) <= roofHalfLength + 1e-9
+}
+
 function setTransitionResult(
   result: SurfaceTransitionResult,
   height: number,
@@ -104,6 +180,10 @@ export function resolveSurfaceTransition(
 
 export function isSafelyAboveTrainRoof(playerFeet: number, trainRoofHeight: number) {
   return playerFeet >= trainRoofHeight - 0.36
+}
+
+export function clearsTrainRoofTop(playerFeet: number, trainRoofHeight: number) {
+  return playerFeet >= trainRoofHeight - 0.04
 }
 
 export function getRouteSurfaceHeight(

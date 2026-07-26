@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test:controls": "tsc src/game/poseControlModel.ts src/game/settings.ts src/game/verticalIntentModel.ts src/game/jumpMotion.ts src/game/runnerRouteModel.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/poseControlModel.mjs && node tests/runnerMotion.mjs && node tests/runnerRoutes.mjs",
+    "test:controls": "tsc src/game/poseControlModel.ts src/game/settings.ts src/game/verticalIntentModel.ts src/game/jumpMotion.ts src/game/runnerRouteModel.ts src/game/readabilityPlacement.ts src/game/trainFormModel.ts src/game/trainFrontModel.ts src/game/trainFrontGeometry.ts src/game/trainLengthModel.ts src/game/cityDepthModel.ts src/game/materialResponseModel.ts src/game/geometryQualityModel.ts src/game/geometryQuality.ts src/game/trackSystemModel.ts src/game/trackSystemGeometry.ts src/game/vegetationModel.ts src/game/buildingMassingModel.ts src/game/buildingFacadeModel.ts src/game/hazardVisualModel.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/poseControlModel.mjs && node tests/runnerMotion.mjs && node tests/runnerRoutes.mjs && node tests/readabilityPlacement.mjs && node tests/trainFormModel.mjs && node tests/trainFrontModel.mjs && node tests/trainLengthModel.mjs && node tests/cityDepthModel.mjs && node tests/materialResponseModel.mjs && node tests/geometryQualityModel.mjs && node tests/trackSystemModel.mjs && node tests/vegetationModel.mjs && node tests/buildingFacadeModel.mjs && node tests/hazardVisualModel.mjs",
+    "test:character": "tsc src/game/playerCharacterModel.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/playerCharacterModel.mjs",
+    "test:ramp": "tsc src/game/runnerRouteModel.ts src/game/rampVisualModel.ts --outDir .control-test-build --target ES2022 --module ES2022 --moduleResolution Bundler --skipLibCheck && node tests/rampVisualModel.mjs",
     "start": "vite preview --host 0.0.0.0 --port 3000",
     "preview": "vite preview"
   },

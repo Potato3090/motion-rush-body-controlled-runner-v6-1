@@ -2,26 +2,6 @@
 
 A mobile-first endless runner controlled by body movement through the phone's front camera. V6 adds reliable jump-to-crouch chaining while preserving V5's crouch-to-jump transition, approved weighted jump physics, torso-normalized intent recognition, persisted Horizontal Sensitivity slider, absolute lane mapping, PWA support, and non-camera controls.
 
-## Current development baseline
-
-The active development branch is `motion-rush-v6-visual-polish`, based on the approved V6 mechanics.
-
-The mechanical phase is considered complete for now. Unless a critical regression is discovered, future work must not redesign or alter:
-
-- the three-lane structure
-- body-tracking controls and calibration
-- absolute left/center/right lane mapping
-- jump and crouch detection
-- sensitivity settings
-- ramps and train-roof traversal
-- scoring, collision, and core gameplay flow
-
-Development from this point should focus on visual polish only: environment art, trains, buildings, character presentation, animation feel, lighting, materials, HUD, effects, audio presentation, scene composition, and mobile performance. Visual improvements must preserve the current mechanics and responsiveness.
-
-Public production build: https://motion-rush-v6-live-3090.netlify.app
-
-V7 remains separate and must not be modified as part of V6 polishing.
-
 ## Run it on Replit
 
 1. Create a new Replit app and import this folder/repository.

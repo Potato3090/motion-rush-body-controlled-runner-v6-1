@@ -13,6 +13,9 @@ const MAX_PHYSICS_STEP = 1 / 120
 export type JumpPhase = 'grounded' | 'takeoff' | 'rising' | 'apex' | 'falling'
 
 export interface JumpMotionState {
+  /** World-space height of the runner's feet at the instant of takeoff. */
+  takeoffHeight: number
+  /** Vertical displacement from takeoffHeight. */
   height: number
   velocity: number
   airborne: boolean
@@ -30,13 +33,14 @@ export interface JumpStepResult {
 }
 
 export function createGroundedJumpMotion(): JumpMotionState {
-  return { height: 0, velocity: 0, airborne: false, elapsed: 0 }
+  return { takeoffHeight: 0, height: 0, velocity: 0, airborne: false, elapsed: 0 }
 }
 
-export function tryStartJump(state: JumpMotionState): JumpRequestResult {
+export function tryStartJump(state: JumpMotionState, takeoffHeight = 0): JumpRequestResult {
   if (state.airborne) return { state, started: false }
   return {
     state: {
+      takeoffHeight: Number.isFinite(takeoffHeight) ? takeoffHeight : 0,
       height: 0,
       velocity: JUMP_INITIAL_VELOCITY,
       airborne: true,
@@ -53,6 +57,7 @@ export function tryStartJump(state: JumpMotionState): JumpRequestResult {
 export function stepJumpMotion(
   state: JumpMotionState,
   deltaSeconds: number,
+  landingSurfaceHeight = 0,
 ): JumpStepResult {
   if (!state.airborne || !Number.isFinite(deltaSeconds) || deltaSeconds <= 0) {
     return { state, landed: false }
@@ -62,23 +67,33 @@ export function stepJumpMotion(
   let velocity = state.velocity
   let elapsed = state.elapsed
   let remaining = Math.min(deltaSeconds, 0.05)
+  const safeLandingSurfaceHeight = Number.isFinite(landingSurfaceHeight)
+    ? landingSurfaceHeight
+    : 0
 
   while (remaining > 0) {
     const step = Math.min(MAX_PHYSICS_STEP, remaining)
     const gravity = velocity > 0 ? JUMP_ASCENT_GRAVITY : JUMP_DESCENT_GRAVITY
     const nextVelocity = Math.max(-MAX_FALL_SPEED, velocity - gravity * step)
-    height += (velocity + nextVelocity) * 0.5 * step
+    const previousWorldHeight = state.takeoffHeight + height
+    const nextHeight = height + (velocity + nextVelocity) * 0.5 * step
+    const nextWorldHeight = state.takeoffHeight + nextHeight
+    height = nextHeight
     velocity = nextVelocity
     elapsed += step
     remaining -= step
 
-    if (height <= 0 && velocity < 0) {
+    if (
+      velocity < 0 &&
+      previousWorldHeight >= safeLandingSurfaceHeight &&
+      nextWorldHeight <= safeLandingSurfaceHeight
+    ) {
       return { state: createGroundedJumpMotion(), landed: true }
     }
   }
 
   return {
-    state: { height, velocity, airborne: true, elapsed },
+    state: { takeoffHeight: state.takeoffHeight, height, velocity, airborne: true, elapsed },
     landed: false,
   }
 }
