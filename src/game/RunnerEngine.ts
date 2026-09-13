@@ -246,7 +246,7 @@ const CHASE_CAMERA = {
   landscapeFov: 55,
 } as const
 const RUNNER_POV_CAMERA = {
-  eyeHeight: PLAYER_CHARACTER.visualFootOffset + PLAYER_CHARACTER.visualHeight * 0.88,
+  eyeHeight: PLAYER_CHARACTER.visualFootOffset + PLAYER_CHARACTER.visualHeight * 0.88 + 1.00,
   crouchDrop: PLAYER_CHARACTER.crouchPelvisDrop * PLAYER_CHARACTER.visualScale + 0.24,
   positionZ: PLAYER_Z - 0.04,
   lookDown: 1.1,
