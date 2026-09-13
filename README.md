@@ -1,10 +1,10 @@
-# Motion Rush V6
+# Motion Rush V6.1
 
-A mobile-first endless runner controlled by body movement through the phone's front camera. V6 adds reliable jump-to-crouch chaining while preserving V5's crouch-to-jump transition, approved weighted jump physics, torso-normalized intent recognition, persisted Horizontal Sensitivity slider, absolute lane mapping, PWA support, and non-camera controls.
+A mobile-first endless runner controlled by body movement through the phone's front camera. V6.1 adds a selectable Third Person / Runner POV camera and an optional in-game body-tracking visualization.
 
-## Current development baseline
+## V6.1 baseline
 
-The active development branch is `motion-rush-v6-visual-polish`, based on the approved V6 mechanics.
+V6.1 is an independent release based on [`Potato3090/motion-rush-body-controlled-runner-v6`](https://github.com/Potato3090/motion-rush-body-controlled-runner-v6), branch `motion-rush-v6-visual-polish`, at commit `ea68ab9939e3e9d72ebcd98983dc0b801056406a`. The original V6 repository, branch, tag, history, and deployment remain unchanged.
 
 The mechanical phase is considered complete for now. Unless a critical regression is discovered, future work must not redesign or alter:
 
@@ -43,6 +43,7 @@ On iPhone, open the published HTTPS URL in Safari. Use **Share → Add to Home S
 - Camera access requires HTTPS on iPhone; Replit's published URL provides it.
 - Stand the phone upright and step back until your shoulders and hips fit in the preview.
 - Calibrate in a relaxed neutral stance.
+- After calibration, choose Third Person or Runner POV and whether the existing body-tracking dock remains visible during the run.
 - Pose landmarks are processed locally in the browser. No camera frames are sent to this app or stored.
 - The MediaPipe pose model is downloaded on first use and then cached by the PWA.
 

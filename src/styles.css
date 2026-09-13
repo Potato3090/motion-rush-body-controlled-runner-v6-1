@@ -303,6 +303,64 @@ button:disabled { cursor: wait; opacity: .72; }
 }
 .camera-choice .picker-check { top: 23px; }
 
+.run-settings {
+  width: min(100%, 390px);
+  margin-bottom: 12px;
+  padding: 11px;
+  display: grid;
+  gap: 11px;
+  border-radius: 16px;
+}
+
+.run-settings fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.run-settings legend,
+.tracking-setting > span {
+  margin: 0 0 7px;
+  padding: 0;
+  color: rgba(255,248,232,.76);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: .11em;
+  text-transform: uppercase;
+}
+
+.segmented-control,
+.tracking-switch {
+  padding: 3px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  background: rgba(8,5,30,.48);
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 11px;
+}
+
+.segmented-control button,
+.tracking-switch span {
+  min-height: 36px;
+  display: grid;
+  place-items: center;
+  color: rgba(255,248,232,.54);
+  background: transparent;
+  border-radius: 8px;
+  font-size: 9px;
+  font-weight: 950;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.segmented-control button.selected,
+.tracking-switch span.selected {
+  color: var(--ink);
+  background: var(--cyan);
+  box-shadow: 0 2px 0 rgba(8,5,30,.5), inset 0 1px 0 rgba(255,255,255,.5);
+}
+
+.tracking-setting { display: grid; grid-template-columns: 1fr 116px; align-items: center; gap: 10px; }
+.tracking-setting > span { margin: 0; }
+.tracking-switch { width: 116px; padding: 3px; }
+.tracking-switch span { min-height: 32px; pointer-events: none; }
+
 .primary-button {
   position: relative;
   width: min(100%, 390px);
@@ -444,6 +502,7 @@ button:disabled { cursor: wait; opacity: .72; }
 
 .camera-dock.collapsed { width: 132px; }
 .camera-dock.tracking { border-color: rgba(69,230,222,.42); }
+.camera-dock.visualization-hidden { visibility: hidden; opacity: 0; pointer-events: none; }
 
 .camera-head { height: 23px; display: flex; align-items: center; justify-content: space-between; padding: 0 2px 5px; }
 .camera-title { display: flex; align-items: center; gap: 6px; font-size: 8px; font-weight: 950; letter-spacing: .13em; }

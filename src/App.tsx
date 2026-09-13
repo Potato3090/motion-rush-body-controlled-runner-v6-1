@@ -30,6 +30,13 @@ import {
 } from 'lucide-react'
 import GameStage, { type GameStageHandle } from './components/GameStage'
 import { HORIZONTAL_SENSITIVITY } from './game/poseControlModel'
+import {
+  DEFAULT_CAMERA_VIEW_MODE,
+  DEFAULT_SHOW_BODY_TRACKING,
+  isCameraDockVisible,
+  resolveCameraViewMode,
+  type CameraViewMode,
+} from './game/presentationSettings'
 import { loadHorizontalSensitivity, saveHorizontalSensitivity } from './game/settings'
 import type { ControlMode, GameSnapshot, GameStatus, RunnerAction, RunnerLane } from './game/types'
 import { usePoseControls } from './hooks/usePoseControls'
@@ -59,6 +66,8 @@ function App() {
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null)
   const [highScore, setHighScore] = useState(() => Number(localStorage.getItem('motion-rush-high-score') || 0))
   const [horizontalSensitivity, setHorizontalSensitivity] = useState(loadHorizontalSensitivity)
+  const [cameraViewMode, setCameraViewMode] = useState<CameraViewMode>(DEFAULT_CAMERA_VIEW_MODE)
+  const [showBodyTracking, setShowBodyTracking] = useState(DEFAULT_SHOW_BODY_TRACKING)
 
   const playTone = useCallback((frequency: number, duration: number, type: OscillatorType = 'sine', volume = 0.04) => {
     if (muted) return
@@ -199,7 +208,9 @@ function App() {
 
   const cameraIsOn = pose.status !== 'off'
   const cameraIsActive = pose.status === 'active'
-  const showCamera = controlMode === 'camera' || cameraIsOn
+  const cameraDockMounted = controlMode === 'camera' || cameraIsOn
+  const cameraDockVisible = isCameraDockVisible(status, controlMode, cameraIsOn, showBodyTracking)
+  const effectiveCameraViewMode = resolveCameraViewMode(controlMode, cameraViewMode)
   const speedPercent = Math.min(100, ((snapshot.speed - 19) / 16) * 100)
   const cameraButton = useMemo(() => {
     if (pose.status === 'off' || pose.status === 'error') return { label: 'Enable body camera', action: pose.enableCamera, icon: Camera }
@@ -230,10 +241,11 @@ function App() {
   }
 
   return (
-    <main className={`app-shell status-${status} ${showCamera && cameraExpanded ? 'camera-open' : ''}`}>
+    <main className={`app-shell status-${status} ${cameraDockVisible && cameraExpanded ? 'camera-open' : ''}`}>
       <GameStage
         ref={stageRef}
         status={status}
+        cameraViewMode={effectiveCameraViewMode}
         onSnapshot={setSnapshot}
         onCrash={onCrash}
         onCoin={onCoin}
@@ -277,8 +289,11 @@ function App() {
         </section>
       )}
 
-      {showCamera && (
-        <aside className={`camera-dock glass ${cameraExpanded ? 'expanded' : 'collapsed'} ${cameraIsActive ? 'tracking' : ''}`}>
+      {cameraDockMounted && (
+        <aside
+          className={`camera-dock glass ${cameraExpanded ? 'expanded' : 'collapsed'} ${cameraIsActive ? 'tracking' : ''} ${cameraDockVisible ? '' : 'visualization-hidden'}`}
+          aria-hidden={!cameraDockVisible}
+        >
           <div className="camera-head">
             <div className="camera-title">
               <span className={`live-dot ${cameraIsActive ? 'is-live' : ''}`} />
@@ -387,6 +402,48 @@ function App() {
               {controlMode === 'camera' && <Check className="picker-check" size={15} />}
             </button>
           </div>
+
+          {controlMode === 'camera' && cameraIsActive && (
+            <section className="run-settings glass" aria-label="Body run settings">
+              <fieldset>
+                <legend>Camera View</legend>
+                <div className="segmented-control" role="radiogroup" aria-label="Camera view">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={cameraViewMode === 'third-person'}
+                    className={cameraViewMode === 'third-person' ? 'selected' : ''}
+                    onClick={() => setCameraViewMode('third-person')}
+                  >
+                    Third Person
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={cameraViewMode === 'runner-pov'}
+                    className={cameraViewMode === 'runner-pov' ? 'selected' : ''}
+                    onClick={() => setCameraViewMode('runner-pov')}
+                  >
+                    Runner POV
+                  </button>
+                </div>
+              </fieldset>
+              <div className="tracking-setting">
+                <span id="show-body-tracking-label">Show Body Tracking</span>
+                <button
+                  type="button"
+                  className="tracking-switch"
+                  role="switch"
+                  aria-labelledby="show-body-tracking-label"
+                  aria-checked={showBodyTracking}
+                  onClick={() => setShowBodyTracking((value) => !value)}
+                >
+                  <span className={!showBodyTracking ? 'selected' : ''}>Off</span>
+                  <span className={showBodyTracking ? 'selected' : ''}>On</span>
+                </button>
+              </div>
+            </section>
+          )}
 
           <button
             className="primary-button"

@@ -1,5 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
 import { RunnerEngine } from '../game/RunnerEngine'
+import type { CameraViewMode } from '../game/presentationSettings'
 import type { GameSnapshot, GameStatus, RunnerAction, RunnerLane } from '../game/types'
 
 export interface GameStageHandle {
@@ -12,13 +13,14 @@ export interface GameStageHandle {
 
 interface GameStageProps {
   status: GameStatus
+  cameraViewMode: CameraViewMode
   onSnapshot: (snapshot: GameSnapshot) => void
   onCrash: (snapshot: GameSnapshot) => void
   onCoin: () => void
 }
 
 const GameStage = forwardRef<GameStageHandle, GameStageProps>(function GameStage(
-  { status, onSnapshot, onCrash, onCoin },
+  { status, cameraViewMode, onSnapshot, onCrash, onCoin },
   ref,
 ) {
   const hostRef = useRef<HTMLDivElement>(null)
@@ -47,6 +49,10 @@ const GameStage = forwardRef<GameStageHandle, GameStageProps>(function GameStage
   useEffect(() => {
     engineRef.current?.setStatus(status)
   }, [status])
+
+  useEffect(() => {
+    engineRef.current?.setCameraViewMode(cameraViewMode)
+  }, [cameraViewMode])
 
   useImperativeHandle(ref, () => ({
     action: (action) => engineRef.current?.action(action),

@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
+import type { CameraViewMode } from './presentationSettings'
 import type { GameSnapshot, GameStatus, RunnerAction, RunnerLane } from './types'
 import {
   JUMP_CLEARANCE_HEIGHT,
@@ -243,6 +244,14 @@ const CHASE_CAMERA = {
   lateralLookFactor: 0.44,
   portraitFov: 61,
   landscapeFov: 55,
+} as const
+const RUNNER_POV_CAMERA = {
+  eyeHeight: PLAYER_CHARACTER.visualFootOffset + PLAYER_CHARACTER.visualHeight * 0.88,
+  crouchDrop: PLAYER_CHARACTER.crouchPelvisDrop * PLAYER_CHARACTER.visualScale + 0.24,
+  positionZ: PLAYER_Z - 0.04,
+  lookDown: 1.1,
+  lookDistance: 28,
+  followRate: 22,
 } as const
 const CAMERA_FAR = 500
 const WORLD_WIDTH = {
@@ -1723,6 +1732,7 @@ export class RunnerEngine {
 
   private animationFrame = 0
   private status: GameStatus = 'menu'
+  private cameraViewMode: CameraViewMode = 'third-person'
   private laneIndex: RunnerLane = 1
   private targetX = 0
   private jumpMotion = createGroundedJumpMotion()
@@ -1843,12 +1853,21 @@ export class RunnerEngine {
       this.supportLaneIndex = 1
       this.surfaceTransitionKind = 'same-lane'
       this.elevatedTransfer.active = false
-      this.camera.position.x = 0
-      this.camera.position.y = CHASE_CAMERA.groundHeight
-      this.camera.position.z = CHASE_CAMERA.positionZ
-      this.camera.lookAt(0, this.cameraLookHeight, CHASE_CAMERA.lookZ)
+      if (this.cameraViewMode === 'third-person') this.resetChaseCameraPresentation()
+      else this.updateRunnerPovCamera(1)
     }
     if (status === 'playing') this.clock.getDelta()
+  }
+
+  setCameraViewMode(mode: CameraViewMode) {
+    if (this.cameraViewMode === mode) return
+    this.cameraViewMode = mode
+    const runnerPov = mode === 'runner-pov'
+    this.playerVisual.visible = !runnerPov
+    if (this.playerShadow) this.playerShadow.visible = !runnerPov
+
+    if (runnerPov) this.updateRunnerPovCamera(1)
+    else this.resetChaseCameraPresentation()
   }
 
   start() {
@@ -1882,8 +1901,8 @@ export class RunnerEngine {
     this.previousLandingSurface.kind = 'ground'
     this.cameraLookHeight = CHASE_CAMERA.lookHeight
     this.cameraLookX = 0
-    this.camera.position.set(0, CHASE_CAMERA.groundHeight, CHASE_CAMERA.positionZ)
-    this.camera.lookAt(0, this.cameraLookHeight, CHASE_CAMERA.lookZ)
+    if (this.cameraViewMode === 'third-person') this.resetChaseCameraPresentation()
+    else this.updateRunnerPovCamera(1)
     this.landingEffectAge = 1
     this.resetWorldObjects()
     this.emitSnapshot()
@@ -5967,6 +5986,12 @@ export class RunnerEngine {
     if (this.status === 'playing') this.updateGame(delta)
     else this.updateIdle(delta)
 
+    if (
+      this.cameraViewMode === 'runner-pov' &&
+      this.status !== 'paused' &&
+      this.status !== 'gameover'
+    ) this.updateRunnerPovCamera(delta)
+
     for (const diagnostic of this.geometryBoundsDiagnostics) {
       diagnostic.helper.box.setFromObject(diagnostic.target)
     }
@@ -6763,6 +6788,7 @@ export class RunnerEngine {
     this.playerVisual.position.y = PLAYER_CHARACTER.visualFootOffset
     this.updatePlayerShadow(this.jumpMotion.height, landingCompression)
 
+    if (this.cameraViewMode === 'runner-pov') return
     const targetCameraY = CHASE_CAMERA.groundHeight + this.surfaceHeight * CHASE_CAMERA.surfaceHeightFactor
     const targetCameraX = this.player.position.x * CHASE_CAMERA.lateralPositionFactor
     this.camera.position.x = THREE.MathUtils.lerp(this.camera.position.x, targetCameraX, 1 - Math.exp(-delta * 7))
@@ -6780,6 +6806,29 @@ export class RunnerEngine {
       1 - Math.exp(-delta * 4),
     )
     this.camera.lookAt(this.cameraLookX, this.cameraLookHeight, CHASE_CAMERA.lookZ)
+  }
+
+  private resetChaseCameraPresentation() {
+    this.cameraLookHeight = CHASE_CAMERA.lookHeight
+    this.cameraLookX = 0
+    this.camera.position.set(0, CHASE_CAMERA.groundHeight, CHASE_CAMERA.positionZ)
+    this.camera.lookAt(0, this.cameraLookHeight, CHASE_CAMERA.lookZ)
+  }
+
+  private updateRunnerPovCamera(delta: number) {
+    const targetX = this.player.position.x
+    const crouchBlend = this.status === 'playing' ? this.crouchVisualBlend : 0
+    const targetY = this.player.position.y + RUNNER_POV_CAMERA.eyeHeight -
+      crouchBlend * RUNNER_POV_CAMERA.crouchDrop
+    const blend = 1 - Math.exp(-delta * RUNNER_POV_CAMERA.followRate)
+    this.camera.position.x = THREE.MathUtils.lerp(this.camera.position.x, targetX, blend)
+    this.camera.position.y = THREE.MathUtils.lerp(this.camera.position.y, targetY, blend)
+    this.camera.position.z = RUNNER_POV_CAMERA.positionZ
+    this.camera.lookAt(
+      this.camera.position.x,
+      this.camera.position.y - RUNNER_POV_CAMERA.lookDown,
+      RUNNER_POV_CAMERA.positionZ - RUNNER_POV_CAMERA.lookDistance,
+    )
   }
 
   private applyCharacterPose(pose: CharacterPose) {
